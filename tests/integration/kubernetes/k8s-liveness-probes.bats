@@ -10,8 +10,8 @@ load "${BATS_TEST_DIRNAME}/../../common.bash"
 
 setup() {
 	sleep_liveness=20
-	agnhost_name=$(get_test_version "container_images.agnhost.name")
-	agnhost_version=$(get_test_version "container_images.agnhost.version")
+	agnhost_name="$(agnhost)"
+	agnhost_version="$(agnhost_version)"
 
 	get_pod_config_dir
 }

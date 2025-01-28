@@ -6,7 +6,7 @@
 use anyhow::{Context, Result};
 use common::{
     message::Message,
-    types::{ContainerConfig, Request},
+    types::{ContainerConfig, TaskRequest},
 };
 use runtimes::RuntimeHandlerManager;
 use tokio::sync::mpsc::channel;
@@ -16,9 +16,9 @@ const WORKER_THREADS: usize = 2;
 
 async fn real_main() {
     let (sender, _receiver) = channel::<Message>(MESSAGE_BUFFER_SIZE);
-    let manager = RuntimeHandlerManager::new("xxx", sender).await.unwrap();
+    let manager = RuntimeHandlerManager::new("xxx", sender).unwrap();
 
-    let req = Request::CreateContainer(ContainerConfig {
+    let req = TaskRequest::CreateContainer(ContainerConfig {
         container_id: "xxx".to_owned(),
         bundle: ".".to_owned(),
         rootfs_mounts: Vec::new(),

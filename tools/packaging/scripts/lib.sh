@@ -6,9 +6,7 @@
 #
 
 export GOPATH=${GOPATH:-${HOME}/go}
-export tests_repo="${tests_repo:-github.com/kata-containers/tests}"
-export tests_repo_dir="$GOPATH/src/$tests_repo"
-export BUILDER_REGISTRY="quay.io/kata-containers/builders"
+export BUILDER_REGISTRY="${BUILDER_REGISTRY:-quay.io/kata-containers/builders}"
 export PUSH_TO_REGISTRY="${PUSH_TO_REGISTRY:-"no"}"
 
 this_script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -17,31 +15,30 @@ export repo_root_dir="$(cd "${this_script_dir}/../../../" && pwd)"
 
 short_commit_length=10
 
-hub_bin="hub-bin"
+gh_cli="gh-cli"
 
-clone_tests_repo() {
-	# KATA_CI_NO_NETWORK is (has to be) ignored if there is
-	# no existing clone.
-	if [ -d "${tests_repo_dir}" ] && [ -n "${KATA_CI_NO_NETWORK:-}" ]; then
-		return
-	fi
-
-	go get -d -u "$tests_repo" || true
-}
+#for cross build
+CROSS_BUILD=${CROSS_BUILD-:}
+BUILDX=""
+PLATFORM=""
+TARGET_ARCH=${TARGET_ARCH:-$(uname -m)}
+ARCH=${ARCH:-$(uname -m)}
+[ "${TARGET_ARCH}" == "aarch64" ] && TARGET_ARCH=arm64
+TARGET_OS=${TARGET_OS:-linux}
+[ "${CROSS_BUILD}" == "true" ] && BUILDX=buildx && PLATFORM="--platform=${TARGET_OS}/${TARGET_ARCH}"
 
 install_yq() {
-	clone_tests_repo
-	pushd "$tests_repo_dir"
-	.ci/install_yq.sh
+	pushd "${repo_root_dir}"
+	./ci/install_yq.sh
 	popd
 }
 
 get_from_kata_deps() {
-	local dependency="$1"
+  local dependency="$1 | explode(.)"
 	versions_file="${this_script_dir}/../../../versions.yaml"
 
 	command -v yq &>/dev/null || die 'yq command is not in your $PATH'
-	result=$("yq" read -X "$versions_file" "$dependency")
+	result=$("yq" "$dependency" "$versions_file")
 	[ "$result" = "null" ] && result=""
 	echo "$result"
 }
@@ -63,26 +60,6 @@ get_repo_hash() {
 	popd >>/dev/null
 }
 
-build_hub() {
-	info "Get hub"
-
-	if cmd=$(command -v hub); then
-		hub_bin="${cmd}"
-		return
-	else
-		hub_bin="${tmp_dir:-/tmp}/hub-bin"
-	fi
-
-	local hub_repo="github.com/github/hub"
-	local hub_repo_dir="${GOPATH}/src/${hub_repo}"
-	[ -d "${hub_repo_dir}" ] || git clone --quiet --depth 1 "https://${hub_repo}.git" "${hub_repo_dir}"
-	pushd "${hub_repo_dir}" >>/dev/null
-	git checkout master
-	git pull
-	./script/build -o "${hub_bin}"
-	popd >>/dev/null
-}
-
 arch_to_golang()
 {
 	local -r arch="$1"
@@ -90,10 +67,27 @@ arch_to_golang()
 	case "$arch" in
 		aarch64) echo "arm64";;
 		ppc64le) echo "$arch";;
+		riscv64) echo "$arch";;
 		x86_64) echo "amd64";;
 		s390x) echo "s390x";;
 		*) die "unsupported architecture: $arch";;
 	esac
+}
+
+get_gh() {
+	info "Get gh"
+
+	if cmd=$(command -v gh); then
+		gh_cli="${cmd}"
+		return
+	else
+		gh_cli="${tmp_dir:-/tmp}/gh-cli"
+	fi
+
+	local goarch=$(arch_to_golang $(uname -m))
+	curl -sSL https://github.com/cli/cli/releases/download/v2.37.0/gh_2.37.0_linux_${goarch}.tar.gz | tar -xz
+	mv gh_2.37.0_linux_${goarch}/bin/gh "${gh_cli}"
+	rm -rf gh_2.37.0_linux_amd64
 }
 
 get_kata_hash() {
@@ -102,18 +96,23 @@ get_kata_hash() {
 	git ls-remote --heads --tags "https://github.com/${project}/${repo}.git" | grep "${ref}" | awk '{print $1}'
 }
 
+merge_two_hashes() {
+	local hash1="${1}"
+	local hash2="${2}"
+
+	echo "${hash1}${hash2}" | sha256sum | cut -c1-9
+}
+
 # $1 - The file we're looking for the last modification
 get_last_modification() {
 	local file="${1}"
 
 	pushd ${repo_root_dir} &> /dev/null
-	# This is a workaround needed for when running this code on Jenkins
-	git config --global --add safe.directory ${repo_root_dir} &> /dev/null
 
 	dirty=""
 	[ $(git status --porcelain | grep "${file#${repo_root_dir}/}" | wc -l) -gt 0 ] && dirty="-dirty"
 
-	echo "$(git log -1 --pretty=format:"%H" ${file})${dirty}"
+	echo "$(git log -1 --abbrev=9 --pretty=format:"%h" ${file})${dirty}"
 	popd &> /dev/null
 }
 
@@ -180,16 +179,29 @@ get_qemu_image_name() {
 
 get_shim_v2_image_name() {
 	shim_v2_script_dir="${repo_root_dir}/tools/packaging/static-build/shim-v2"
-	echo "${BUILDER_REGISTRY}:shim-v2-go-$(get_from_kata_deps "languages.golang.meta.newest-version")-rust-$(get_from_kata_deps "languages.rust.meta.newest-version")-$(get_last_modification ${shim_v2_script_dir})-$(uname -m)"
+	echo "${BUILDER_REGISTRY}:shim-v2-go-$(get_from_kata_deps ".languages.golang.meta.newest-version")-rust-$(get_from_kata_deps ".languages.rust.meta.newest-version")-$(get_last_modification ${shim_v2_script_dir})-$(uname -m)"
+}
+
+get_ovmf_image_name() {
+	ovmf_script_dir="${repo_root_dir}/tools/packaging/static-build/ovmf"
+	echo "${BUILDER_REGISTRY}:ovmf-$(get_last_modification ${ovmf_script_dir})-$(uname -m)"
+}
+
+get_busybox_image_name() {
+	busybox_script_dir="${repo_root_dir}/tools/packaging/static-build/busybox"
+	echo "${BUILDER_REGISTRY}:busybox-$(get_last_modification "${busybox_script_dir}")-$(uname -m)"
 }
 
 get_virtiofsd_image_name() {
-	ARCH=$(uname -m)
+	ARCH=${ARCH:-$(uname -m)}
 	case ${ARCH} in
 	        "aarch64")
 	                libc="musl"
 	                ;;
 	        "ppc64le")
+	                libc="gnu"
+	                ;;
+	        "riscv64")
 	                libc="gnu"
 	                ;;
 	        "s390x")
@@ -201,5 +213,33 @@ get_virtiofsd_image_name() {
 	esac
 
 	virtiofsd_script_dir="${repo_root_dir}/tools/packaging/static-build/virtiofsd"
-	echo "${BUILDER_REGISTRY}:virtiofsd-$(get_from_kata_deps "externals.virtiofsd.toolchain")-${libc}-$(get_last_modification ${virtiofsd_script_dir})-$(uname -m)"
+	echo "${BUILDER_REGISTRY}:virtiofsd-$(get_from_kata_deps ".externals.virtiofsd.toolchain")-${libc}-$(get_last_modification ${virtiofsd_script_dir})-$(uname -m)"
+}
+
+get_tools_image_name() {
+	tools_script_dir="${repo_root_dir}/tools/packaging/static-build/tools"
+	tools_dir="${repo_root_dir}/src/tools"
+	libs_dir="${repo_root_dir}/src/libs"
+	agent_dir="${repo_root_dir}/src/agent"
+
+	echo "${BUILDER_REGISTRY}:tools-$(get_last_modification ${tools_dir})-$(get_last_modification ${libs_dir})-$(get_last_modification ${agent_dir})-$(get_last_modification ${tools_script_dir})-$(uname -m)"
+}
+
+get_agent_image_name() {
+	libseccomp_hash=$(merge_two_hashes \
+		"$(get_last_modification "${repo_root_dir}/ci/install_libseccomp.sh")" \
+		"$(get_last_modification "${repo_root_dir}/tools/packaging/kata-deploy/local-build/kata-deploy-copy-libseccomp-installer.sh")")
+	agent_dir="${repo_root_dir}/tools/packaging/static-build/agent"
+
+	echo "${BUILDER_REGISTRY}:agent-${libseccomp_hash}-$(get_last_modification ${agent_dir})-$(uname -m)"
+}
+
+get_coco_guest_components_image_name() {
+	coco_guest_components_script_dir="${repo_root_dir}/tools/packaging/static-build/coco-guest-components"
+	echo "${BUILDER_REGISTRY}:coco-guest-components-$(get_from_kata_deps ".externals.coco-guest-components.toolchain")-$(get_last_modification ${coco_guest_components_script_dir})-$(uname -m)"
+}
+
+get_pause_image_name() {
+	pause_image_script_dir="${repo_root_dir}/tools/packaging/static-build/pause-image"
+	echo "${BUILDER_REGISTRY}:pause-image-$(get_last_modification ${pause_image_script_dir})-$(uname -m)"
 }

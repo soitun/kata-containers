@@ -17,6 +17,7 @@ import (
 	"github.com/prometheus/procfs"
 	"github.com/urfave/cli"
 
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/config"
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/katautils"
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/oci"
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/utils"
@@ -29,7 +30,7 @@ import (
 //
 // XXX: Increment for every change to the output format
 // (meaning any change to the EnvInfo type).
-const formatVersion = "1.0.26"
+const formatVersion = "1.0.27"
 
 // MetaInfo stores information on the format of the output itself
 type MetaInfo struct {
@@ -100,21 +101,32 @@ type RuntimeVersionInfo struct {
 	Version VersionInfo
 }
 
+type SecurityInfo struct {
+	Rootless          bool
+	DisableSeccomp    bool
+	GuestHookPath     string
+	EnableAnnotations []string
+	ConfidentialGuest bool
+}
+
 // HypervisorInfo stores hypervisor details
 type HypervisorInfo struct {
-	MachineType          string
-	Version              string
-	Path                 string
-	BlockDeviceDriver    string
-	EntropySource        string
-	SharedFS             string
-	VirtioFSDaemon       string
-	SocketPath           string
-	Msize9p              uint32
-	MemorySlots          uint32
-	PCIeRootPort         uint32
-	HotplugVFIOOnRootBus bool
-	Debug                bool
+	MachineType       string
+	Version           string
+	Path              string
+	BlockDeviceDriver string
+	EntropySource     string
+	SharedFS          string
+	VirtioFSDaemon    string
+	SocketPath        string
+	Msize9p           uint32
+	MemorySlots       uint32
+	HotPlugVFIO       config.PCIePort
+	ColdPlugVFIO      config.PCIePort
+	PCIeRootPort      uint32
+	PCIeSwitchPort    uint32
+	Debug             bool
+	SecurityInfo      SecurityInfo
 }
 
 // AgentInfo stores agent details
@@ -283,6 +295,16 @@ func getAgentInfo(config oci.RuntimeConfig) (AgentInfo, error) {
 	return agent, nil
 }
 
+func getSecurityInfo(config vc.HypervisorConfig) SecurityInfo {
+	return SecurityInfo{
+		Rootless:          config.Rootless,
+		DisableSeccomp:    config.DisableSeccomp,
+		GuestHookPath:     config.GuestHookPath,
+		EnableAnnotations: config.EnableAnnotations,
+		ConfidentialGuest: config.ConfidentialGuest,
+	}
+}
+
 func getHypervisorInfo(config oci.RuntimeConfig) (HypervisorInfo, error) {
 	hypervisorPath := config.HypervisorConfig.HypervisorPath
 
@@ -304,6 +326,8 @@ func getHypervisorInfo(config oci.RuntimeConfig) (HypervisorInfo, error) {
 		}
 	}
 
+	securityInfo := getSecurityInfo(config.HypervisorConfig)
+
 	return HypervisorInfo{
 		Debug:             config.HypervisorConfig.Debug,
 		MachineType:       config.HypervisorConfig.HypervisorMachineType,
@@ -315,10 +339,12 @@ func getHypervisorInfo(config oci.RuntimeConfig) (HypervisorInfo, error) {
 		EntropySource:     config.HypervisorConfig.EntropySource,
 		SharedFS:          config.HypervisorConfig.SharedFS,
 		VirtioFSDaemon:    config.HypervisorConfig.VirtioFSDaemon,
-
-		HotplugVFIOOnRootBus: config.HypervisorConfig.HotplugVFIOOnRootBus,
-		PCIeRootPort:         config.HypervisorConfig.PCIeRootPort,
-		SocketPath:           socketPath,
+		HotPlugVFIO:       config.HypervisorConfig.HotPlugVFIO,
+		ColdPlugVFIO:      config.HypervisorConfig.ColdPlugVFIO,
+		PCIeRootPort:      config.HypervisorConfig.PCIeRootPort,
+		PCIeSwitchPort:    config.HypervisorConfig.PCIeSwitchPort,
+		SocketPath:        socketPath,
+		SecurityInfo:      securityInfo,
 	}, nil
 }
 

@@ -17,11 +17,14 @@ pub mod manager;
 mod manager_inner;
 pub mod network;
 pub mod resource_persist;
+use hypervisor::{BlockConfig, HybridVsockConfig, VsockConfig};
 use network::NetworkConfig;
 pub mod rootfs;
 pub mod share_fs;
 pub mod volume;
 pub use manager::ResourceManager;
+pub mod cdi_devices;
+pub mod cpu_mem;
 
 use kata_types::config::hypervisor::SharedFsInfo;
 
@@ -29,4 +32,14 @@ use kata_types::config::hypervisor::SharedFsInfo;
 pub enum ResourceConfig {
     Network(NetworkConfig),
     ShareFs(SharedFsInfo),
+    VmRootfs(BlockConfig),
+    HybridVsock(HybridVsockConfig),
+    Vsock(VsockConfig),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ResourceUpdateOp {
+    Add,
+    Del,
+    Update,
 }

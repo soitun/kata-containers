@@ -13,8 +13,10 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/container-orchestrated-devices/container-device-interface/pkg/cdi"
 	"github.com/go-ini/ini"
 	vcTypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
+	"github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
 )
 
@@ -81,6 +83,17 @@ const (
 
 	// VirtioFSNydus means use nydus for the shared file system
 	VirtioFSNydus = "virtio-fs-nydus"
+
+	// NoSharedFS means *no* shared file system solution will be used
+	// and files will be copied into the guest system.
+	//
+	// WARNING: This should be carefully used, and only used in very few
+	// specific cases, as any update to the mount will *NOT* be reflected
+	// during the lifecycle of the pod, causing issues with rotation of
+	// secrets, certs, or configurations via kubernetes objects like
+	// configMaps or secrets, as those will be copied into the guest at
+	// *pod* *creation* *time*.
+	NoSharedFS = "none"
 )
 
 const (
@@ -114,13 +127,114 @@ const (
 // SysDevPrefix is static string of /sys/dev
 var SysDevPrefix = "/sys/dev"
 
-// SysIOMMUPath is static string of /sys/kernel/iommu_groups
-var SysIOMMUPath = "/sys/kernel/iommu_groups"
+// SysIOMMUGroupPath is static string of /sys/kernel/iommu_groups
+var SysIOMMUGroupPath = "/sys/kernel/iommu_groups"
 
 // SysBusPciDevicesPath is static string of /sys/bus/pci/devices
 var SysBusPciDevicesPath = "/sys/bus/pci/devices"
 
 var getSysDevPath = getSysDevPathImpl
+
+// PCIePortBusPrefix gives us the correct bus nameing dependeing on the port
+// used to hot(cold)-plug the device
+type PCIePortBusPrefix string
+
+const (
+	PCIeRootPortPrefix              PCIePortBusPrefix = "rp"
+	PCIeSwitchPortPrefix            PCIePortBusPrefix = "sw"
+	PCIeSwitchUpstreamPortPrefix    PCIePortBusPrefix = "swup"
+	PCIeSwitchhDownstreamPortPrefix PCIePortBusPrefix = "swdp"
+	PCIBridgePortPrefix             PCIePortBusPrefix = "bp"
+)
+
+func (p PCIePortBusPrefix) String() string {
+	switch p {
+	case PCIeRootPortPrefix:
+		fallthrough
+	case PCIeSwitchPortPrefix:
+		fallthrough
+	case PCIeSwitchUpstreamPortPrefix:
+		fallthrough
+	case PCIeSwitchhDownstreamPortPrefix:
+		fallthrough
+	case PCIBridgePortPrefix:
+		return string(p)
+	}
+	return fmt.Sprintf("<unknown PCIePortBusPrefix: %s>", string(p))
+}
+
+// PCIePort distinguish only between root and switch port
+type PCIePort string
+
+const (
+	// RootPort attach VFIO devices to a root-port
+	RootPort PCIePort = "root-port"
+	// SwitchPort attach VFIO devices to a switch-port
+	SwitchPort = "switch-port"
+	// BridgePort is the default
+	BridgePort = "bridge-port"
+	// NoPort is for disabling VFIO hotplug/coldplug
+	NoPort = "no-port"
+	// InvalidPort is for invalid port
+	InvalidPort = "invalid-port"
+)
+
+func (p PCIePort) String() string {
+	switch p {
+	case RootPort:
+		fallthrough
+	case SwitchPort:
+		fallthrough
+	case BridgePort:
+		fallthrough
+	case NoPort:
+		fallthrough
+	case InvalidPort:
+		return string(p)
+	}
+	return fmt.Sprintf("<unknown PCIePort: %s>", string(p))
+}
+
+var PCIePortPrefixMapping = map[PCIePort]PCIePortBusPrefix{
+	RootPort:   PCIeRootPortPrefix,
+	SwitchPort: PCIeSwitchhDownstreamPortPrefix,
+	BridgePort: PCIBridgePortPrefix,
+}
+
+func (p PCIePort) Invalid() bool {
+	switch p {
+	case RootPort:
+		fallthrough
+	case SwitchPort:
+		fallthrough
+	case BridgePort:
+		fallthrough
+	case NoPort:
+		return false
+	}
+	return true
+}
+
+func (p PCIePort) Valid() bool {
+	switch p {
+	case RootPort:
+		fallthrough
+	case SwitchPort:
+		fallthrough
+	case BridgePort:
+		fallthrough
+	case NoPort:
+		return true
+	}
+	return false
+}
+
+var (
+	// Each of this structures keeps track of the devices attached to the
+	// different types of PCI ports. We can deduces the Bus number from it
+	// and eliminate duplicates being assigned.
+	PCIeDevicesPerPort = map[PCIePort][]VFIODev{}
+)
 
 // DeviceInfo is an embedded type that contains device data common to all types of devices.
 type DeviceInfo struct {
@@ -167,6 +281,9 @@ type DeviceInfo struct {
 	// ColdPlug specifies whether the device must be cold plugged (true)
 	// or hot plugged (false).
 	ColdPlug bool
+
+	// Specifies the PCIe port type to which the device is attached
+	Port PCIePort
 }
 
 // BlockDrive represents a block storage drive which may be used in case the storage
@@ -268,14 +385,8 @@ const (
 	VFIOAPDeviceMediatedType
 )
 
-type VFIODev interface {
-	GetID() *string
-	GetType() VFIODeviceType
-	GetSysfsDev() *string
-}
-
-// VFIOPCIDev represents a VFIO PCI device used for hotplugging
-type VFIOPCIDev struct {
+// VFIODev represents a VFIO PCI device used for hotplugging
+type VFIODev struct {
 	// ID is used to identify this drive in the hypervisor options.
 	ID string
 
@@ -305,44 +416,16 @@ type VFIOPCIDev struct {
 
 	// IsPCIe specifies device is PCIe or PCI
 	IsPCIe bool
-}
-
-func (d VFIOPCIDev) GetID() *string {
-	return &d.ID
-}
-
-func (d VFIOPCIDev) GetType() VFIODeviceType {
-	return d.Type
-}
-
-func (d VFIOPCIDev) GetSysfsDev() *string {
-	return &d.SysfsDev
-}
-
-type VFIOAPDev struct {
-	// ID is used to identify this drive in the hypervisor options.
-	ID string
-
-	// sysfsdev of VFIO mediated device
-	SysfsDev string
 
 	// APDevices are the Adjunct Processor devices assigned to the mdev
 	APDevices []string
 
-	// Type of VFIO device
-	Type VFIODeviceType
-}
+	// Port is the PCIe port type to which the device is attached
+	Port PCIePort
 
-func (d VFIOAPDev) GetID() *string {
-	return &d.ID
-}
-
-func (d VFIOAPDev) GetType() VFIODeviceType {
-	return d.Type
-}
-
-func (d VFIOAPDev) GetSysfsDev() *string {
-	return &d.SysfsDev
+	// HostPath is the path to the device on the host we need it as a reference
+	// to match a /dev/vfio/<num> device to a device in GK mode
+	HostPath string
 }
 
 // RNGDev represents a random number generator device
@@ -396,6 +479,10 @@ var GetVhostUserNodeStatFunc = GetVhostUserNodeStat
 func GetHostPath(devInfo DeviceInfo, vhostUserStoreEnabled bool, vhostUserStorePath string) (string, error) {
 	if devInfo.ContainerPath == "" {
 		return "", fmt.Errorf("Empty path provided for device")
+	}
+
+	if devInfo.Major == -1 {
+		return devInfo.HostPath, nil
 	}
 
 	// Filter out vhost-user storage devices by device Major numbers.
@@ -556,4 +643,61 @@ type DeviceState struct {
 	// ColdPlug specifies whether the device must be cold plugged (true)
 	// or hot plugged (false).
 	ColdPlug bool
+}
+
+// CDI (Container Device Interface), is a specification, for container- runtimes,
+// to support third-party devices.
+// It introduces an abstract notion of a device as a resource. Such devices are
+// uniquely specified by a fully-qualified name that is constructed from a
+// vendor ID, a device class, and a name that is unique per vendor ID-device
+// class pair.
+//
+// vendor.com/class=unique_name
+//
+// The combination of vendor ID and device class (vendor.com/class in the
+// above example) is referred to as the device kind.
+// CDI concerns itself only with enabling containers to be device aware.
+// Areas like resource management are explicitly left out of CDI (and are
+// expected to be handled by the orchestrator). Because of this focus, the CDI
+// specification is simple to implement and allows great flexibility for
+// runtimes and orchestrators.
+func WithCDI(annotations map[string]string, cdiSpecDirs []string, spec *specs.Spec) (*specs.Spec, error) {
+	// Add devices from CDI annotations
+	_, devsFromAnnotations, err := cdi.ParseAnnotations(annotations)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse CDI device annotations: %w", err)
+	}
+
+	if len(devsFromAnnotations) == 0 {
+		// No devices found, skip device injection
+		return spec, nil
+	}
+
+	var registry cdi.Registry
+	if len(cdiSpecDirs) > 0 {
+		// We can override the directories where to search for CDI specs
+		// if needed, the default is /etc/cdi /var/run/cdi
+		registry = cdi.GetRegistry(cdi.WithSpecDirs(cdiSpecDirs...))
+	} else {
+		registry = cdi.GetRegistry()
+	}
+
+	if err = registry.Refresh(); err != nil {
+		// We don't consider registry refresh failure a fatal error.
+		// For instance, a dynamically generated invalid CDI Spec file for
+		// any particular vendor shouldn't prevent injection of devices of
+		// different vendors. CDI itself knows better and it will fail the
+		// injection if necessary.
+		return nil, fmt.Errorf("CDI registry refresh failed: %w", err)
+	}
+
+	if _, err := registry.InjectDevices(spec, devsFromAnnotations...); err != nil {
+		return nil, fmt.Errorf("CDI device injection failed: %w", err)
+	}
+
+	// One crucial thing to keep in mind is that CDI device injection
+	// might add OCI Spec environment variables, hooks, and mounts as
+	// well. Therefore it is important that none of the corresponding
+	// OCI Spec fields are reset up in the call stack once we return.
+	return spec, nil
 }

@@ -41,6 +41,11 @@ rootfs_type=@DEFROOTFSTYPE@
 # Default false
 # confidential_guest = true
 
+# Enable running clh VMM as a non-root user.
+# By default clh VMM run as root. When this is set to true, clh VMM process runs as
+# a non-root random user. See documentation for the limitations of this mode.
+# rootless = true
+
 # disable applying SELinux on the VMM process (default false)
 disable_selinux=@DEFDISABLESELINUX@
 
@@ -126,6 +131,7 @@ default_maxmemory = @DEFMAXMEMSZ@
 # Shared file system type:
 #   - virtio-fs (default)
 #   - virtio-fs-nydus
+#   - none
 shared_fs = "@DEFSHAREDFS_CLH_VIRTIOFS@"
 
 # Path to vhost-user-fs daemon.
@@ -145,9 +151,9 @@ virtio_fs_queue_size = @DEFVIRTIOFSQUEUESIZE@
 # Extra args for virtiofsd daemon
 #
 # Format example:
-#   ["-o", "arg1=xxx,arg2", "-o", "hello world", "--arg3=yyy"]
+#   ["--arg1=xxx", "--arg2=yyy"]
 # Examples:
-#   Set virtiofsd log level to debug : ["-o", "log_level=debug"] or ["-d"]
+#   Set virtiofsd log level to debug : ["--log-level=debug"]
 # see `virtiofsd -h` for possible options.
 virtio_fs_extra_args = @DEFVIRTIOFSEXTRAARGS@
 
@@ -170,6 +176,15 @@ virtio_fs_cache = "@DEFVIRTIOFSCACHE@"
 # rootfs is backed by a block device. This is virtio-blk.
 block_device_driver = "virtio-blk"
 
+# Specifies cache-related options will be set to block devices or not.
+# Default false
+#block_device_cache_set = true
+
+# Specifies cache-related options for block devices.
+# Denotes whether use of O_DIRECT (bypass the host page cache) is enabled.
+# Default false
+#block_device_cache_direct = true
+
 # Enable huge pages for VM RAM, default false
 # Enabling this will result in the VM memory
 # being allocated using huge pages.
@@ -178,11 +193,21 @@ block_device_driver = "virtio-blk"
 # Disable the 'seccomp' feature from Cloud Hypervisor, default false
 # disable_seccomp = true
 
+# Enable vIOMMU, default false
+# Enabling this will result in the VM having a vIOMMU device
+# This will also add the following options to the kernel's
+# command line: iommu=pt
+#enable_iommu = true
+
 # This option changes the default hypervisor and kernel parameters
 # to enable debug output where available.
 #
 # Default false
 #enable_debug = true
+
+# Enable hot-plugging of VFIO devices to a root-port.
+# The default setting is  "no-port"
+#hot_plug_vfio = "root-port"
 
 # Path to OCI hook binaries in the *guest rootfs*.
 # This does not affect host-side hooks which must instead be added to
@@ -300,8 +325,12 @@ block_device_driver = "virtio-blk"
 #debug_console_enabled = true
 
 # Agent connection dialing timeout value in seconds
-# (default: 30)
-#dial_timeout = 30
+# (default: 45)
+dial_timeout = 45
+
+# Confidential Data Hub API timeout value in seconds
+# (default: 50)
+#cdh_api_timeout = 50
 
 [runtime]
 # If enabled, the runtime will log additional debug messages to the
@@ -380,7 +409,7 @@ sandbox_cgroup_only=@DEFSANDBOXCGROUPONLY@
 # - When running with pods, sandbox sizing information will only be available if using Kubernetes >= 1.23 and containerd >= 1.6. CRI-O
 #   does not yet support sandbox sizing annotations.
 # - When running single containers using a tool like ctr, container sizing information will be available.
-static_sandbox_resource_mgmt=@DEFSTATICRESOURCEMGMT@
+static_sandbox_resource_mgmt=@DEFSTATICRESOURCEMGMT_CLH@
 
 # If specified, sandbox_bind_mounts identifieds host paths to be mounted (ro) into the sandboxes shared path.
 # This is only valid if filesystem sharing is utilized. The provided path(s) will be bindmounted into the shared fs directory.
@@ -424,29 +453,19 @@ experimental=@DEFAULTEXPFEATURES@
 # (default: false)
 # enable_pprof = true
 
-# WARNING: All the options in the following section have not been implemented yet.
-# This section was added as a placeholder. DO NOT USE IT!
-[image]
-# Container image service.
-#
-# Offload the CRI image management service to the Kata agent.
-# (default: false)
-#service_offload = true
+# Indicates the CreateContainer request timeout needed for the workload(s)
+# It using guest_pull this includes the time to pull the image inside the guest
+# Defaults to @DEFCREATECONTAINERTIMEOUT@ second(s)  
+# Note: The effective timeout is determined by the lesser of two values: runtime-request-timeout from kubelet config 
+# (https://kubernetes.io/docs/reference/command-line-tools-reference/kubelet/#:~:text=runtime%2Drequest%2Dtimeout) and create_container_timeout. 
+# In essence, the timeout used for guest pull=runtime-request-timeout<create_container_timeout?runtime-request-timeout:create_container_timeout.
+create_container_timeout = @DEFCREATECONTAINERTIMEOUT@
 
-# Container image decryption keys provisioning.
-# Applies only if service_offload is true.
-# Keys can be provisioned locally (e.g. through a special command or
-# a local file) or remotely (usually after the guest is remotely attested).
-# The provision setting is a complete URL that lets the Kata agent decide
-# which method to use in order to fetch the keys.
-#
-# Keys can be stored in a local file, in a measured and attested initrd:
-#provision=data:///local/key/file
-#
-# Keys could be fetched through a special command or binary from the
-# initrd (guest) image, e.g. a firmware call:
-#provision=file:///path/to/bin/fetcher/in/guest
-#
-# Keys can be remotely provisioned. The Kata agent fetches them from e.g.
-# a HTTPS URL:
-#provision=https://my-key-broker.foo/tenant/<tenant-id>
+# Base directory of directly attachable network config.
+# Network devices for VM-based containers are allowed to be placed in the
+# host netns to eliminate as many hops as possible, which is what we
+# called a "Directly Attachable Network". The config, set by special CNI
+# plugins, is used to tell the Kata containers what devices are attached
+# to the hypervisor.
+# (default: /run/kata-containers/dans)
+dan_conf = "@DEFDANCONF@"

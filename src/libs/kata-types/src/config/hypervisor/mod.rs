@@ -22,17 +22,18 @@
 //! part and common part. But the Kata 2.0 has adopted a policy to build a superset for all
 //! hypervisors, so let's contain it...
 
+use super::{default, ConfigOps, ConfigPlugin, TomlConfig};
+use crate::annotations::KATA_ANNO_CFG_HYPERVISOR_PREFIX;
+use crate::{eother, resolve_path, sl, validate_path};
+use byte_unit::{Byte, Unit};
+use lazy_static::lazy_static;
+use regex::RegexSet;
+use serde_enum_str::{Deserialize_enum_str, Serialize_enum_str};
 use std::collections::HashMap;
 use std::io::{self, Result};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-
-use lazy_static::lazy_static;
-use regex::RegexSet;
-
-use super::{default, ConfigOps, ConfigPlugin, TomlConfig};
-use crate::annotations::KATA_ANNO_CFG_HYPERVISOR_PREFIX;
-use crate::{eother, resolve_path, sl, validate_path};
+use sysinfo::System;
 
 mod dragonball;
 pub use self::dragonball::{DragonballConfig, HYPERVISOR_NAME_DRAGONBALL};
@@ -43,11 +44,27 @@ pub use self::qemu::{QemuConfig, HYPERVISOR_NAME_QEMU};
 mod ch;
 pub use self::ch::{CloudHypervisorConfig, HYPERVISOR_NAME_CH};
 
-const VIRTIO_BLK: &str = "virtio-blk";
-const VIRTIO_BLK_MMIO: &str = "virtio-mmio";
-const VIRTIO_BLK_CCW: &str = "virtio-blk-ccw";
-const VIRTIO_SCSI: &str = "virtio-scsi";
-const VIRTIO_PMEM: &str = "nvdimm";
+mod remote;
+pub use self::remote::{RemoteConfig, HYPERVISOR_NAME_REMOTE};
+
+/// Virtual PCI block device driver.
+pub const VIRTIO_BLK_PCI: &str = "virtio-blk-pci";
+
+/// Virtual MMIO block device driver.
+pub const VIRTIO_BLK_MMIO: &str = "virtio-blk-mmio";
+
+/// Virtual CCW block device driver.
+pub const VIRTIO_BLK_CCW: &str = "virtio-blk-ccw";
+
+/// Virtual SCSI block device driver.
+pub const VIRTIO_SCSI: &str = "virtio-scsi";
+
+/// Virtual PMEM device driver.
+pub const VIRTIO_PMEM: &str = "virtio-pmem";
+
+mod firecracker;
+pub use self::firecracker::{FirecrackerConfig, HYPERVISOR_NAME_FIRECRACKER};
+
 const VIRTIO_9P: &str = "virtio-9p";
 const VIRTIO_FS: &str = "virtio-fs";
 const VIRTIO_FS_INLINE: &str = "inline-virtio-fs";
@@ -172,7 +189,7 @@ impl BlockDeviceInfo {
             return Ok(());
         }
         let l = [
-            VIRTIO_BLK,
+            VIRTIO_BLK_PCI,
             VIRTIO_BLK_CCW,
             VIRTIO_BLK_MMIO,
             VIRTIO_PMEM,
@@ -221,6 +238,10 @@ pub struct BootInfo {
     /// If you want that qemu uses the default firmware leave this option empty.
     #[serde(default)]
     pub firmware: String,
+    /// Block storage driver to be used for the VM rootfs is backed
+    /// by a block device. This is virtio-pmem, virtio-blk-pci or virtio-blk-mmio
+    #[serde(default)]
+    pub vm_rootfs_driver: String,
 }
 
 impl BootInfo {
@@ -230,6 +251,11 @@ impl BootInfo {
         resolve_path!(self.image, "guest boot image file {} is invalid: {}")?;
         resolve_path!(self.initrd, "guest initrd image file {} is invalid: {}")?;
         resolve_path!(self.firmware, "firmware image file {} is invalid: {}")?;
+
+        if self.vm_rootfs_driver.is_empty() {
+            self.vm_rootfs_driver = default::DEFAULT_BLOCK_DEVICE_TYPE.to_string();
+        }
+
         Ok(())
     }
 
@@ -242,6 +268,21 @@ impl BootInfo {
         if !self.image.is_empty() && !self.initrd.is_empty() {
             return Err(eother!("Can not configure both initrd and image for boot"));
         }
+
+        let l = [
+            VIRTIO_BLK_PCI,
+            VIRTIO_BLK_CCW,
+            VIRTIO_BLK_MMIO,
+            VIRTIO_PMEM,
+            VIRTIO_SCSI,
+        ];
+        if !l.contains(&self.vm_rootfs_driver.as_str()) {
+            return Err(eother!(
+                "{} is unsupported block device type.",
+                self.vm_rootfs_driver
+            ));
+        }
+
         Ok(())
     }
 
@@ -350,6 +391,17 @@ pub struct DebugInfo {
     #[serde(default)]
     pub enable_debug: bool,
 
+    /// The log log level will be applied to hypervisor.
+    /// Possible values are:
+    /// - trace
+    /// - debug
+    /// - info
+    /// - warn
+    /// - error
+    /// - critical
+    #[serde(default = "default_hypervisor_log_level")]
+    pub log_level: String,
+
     /// Enable dumping information about guest page structures if true.
     #[serde(default)]
     pub guest_memory_dump_paging: bool,
@@ -365,6 +417,20 @@ pub struct DebugInfo {
     /// much disk space.
     #[serde(default)]
     pub guest_memory_dump_path: String,
+
+    /// This option allows to add a debug monitor socket when `enable_debug = true`
+    /// WARNING: Anyone with access to the monitor socket can take full control of
+    /// Qemu. This is for debugging purpose only and must *NEVER* be used in
+    /// production.
+    /// Valid values are :
+    /// - "hmp"
+    /// - "qmp"
+    /// - "qmp-pretty" (same as "qmp" with pretty json formatting)
+    /// If set to the empty string "", no debug monitor socket is added. This is
+    /// the default.
+    /// dbg_monitor_socket = "hmp"
+    #[serde(default)]
+    pub dbg_monitor_socket: String,
 }
 
 impl DebugInfo {
@@ -377,6 +443,10 @@ impl DebugInfo {
     pub fn validate(&self) -> Result<()> {
         Ok(())
     }
+}
+
+fn default_hypervisor_log_level() -> String {
+    String::from("info")
 }
 
 /// Virtual machine device configuration information.
@@ -424,6 +494,12 @@ pub struct DeviceInfo {
     /// Enabling this will result in the VM device having iommu_platform=on set
     #[serde(default)]
     pub enable_iommu_platform: bool,
+
+    /// Enable balloon f_reporting, default false
+    ///
+    /// Enabling this will result in the VM balloon device having f_reporting=on set
+    #[serde(default)]
+    pub reclaim_guest_freed_memory: bool,
 }
 
 impl DeviceInfo {
@@ -445,6 +521,40 @@ impl DeviceInfo {
             ));
         }
         Ok(())
+    }
+}
+
+/// Virtual machine PCIe Topology configuration.
+#[derive(Clone, Debug, Default)]
+pub struct TopologyConfigInfo {
+    /// Hypervisor name
+    pub hypervisor_name: String,
+    /// Device Info
+    pub device_info: DeviceInfo,
+}
+
+impl TopologyConfigInfo {
+    /// Initialize the topology config info from toml config
+    pub fn new(toml_config: &TomlConfig) -> Option<Self> {
+        // Firecracker does not support PCIe Devices, so we should not initialize such a PCIe topology for it.
+        // If the case of fc hit, just return None.
+        let hypervisor_names = [
+            HYPERVISOR_NAME_QEMU,
+            HYPERVISOR_NAME_CH,
+            HYPERVISOR_NAME_DRAGONBALL,
+            HYPERVISOR_NAME_FIRECRACKER,
+            HYPERVISOR_NAME_REMOTE,
+        ];
+        let hypervisor_name = toml_config.runtime.hypervisor_name.as_str();
+        if !hypervisor_names.contains(&hypervisor_name) {
+            return None;
+        }
+
+        let hv = toml_config.hypervisor.get(hypervisor_name)?;
+        Some(Self {
+            hypervisor_name: hypervisor_name.to_string(),
+            device_info: hv.device_info.clone(),
+        })
     }
 }
 
@@ -516,12 +626,38 @@ impl MachineInfo {
     }
 }
 
+/// Huge page type for VM RAM backend
+#[derive(Clone, Debug, Deserialize_enum_str, Serialize_enum_str, PartialEq, Eq)]
+pub enum HugePageType {
+    /// This will result in the VM memory being allocated using hugetlbfs backend. This is useful
+    /// when you want to use vhost-user network stacks within the container. This will automatically
+    /// result in memory pre allocation.
+    #[serde(rename = "hugetlbfs")]
+    Hugetlbfs,
+    /// This will result in the VM memory being allocated using transparant huge page backend.
+    #[serde(rename = "thp")]
+    THP,
+}
+
+impl Default for HugePageType {
+    fn default() -> Self {
+        Self::Hugetlbfs
+    }
+}
+
 /// Virtual machine memory configuration information.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct MemoryInfo {
     /// Default memory size in MiB for SB/VM.
     #[serde(default)]
     pub default_memory: u32,
+
+    /// Default maximum memory in MiB per SB / VM
+    /// unspecified or == 0           --> will be set to the actual amount of physical RAM
+    /// > 0 <= amount of physical RAM --> will be set to the specified number
+    /// > amount of physical RAM      --> will be set to the actual amount of physical RAM
+    #[serde(default)]
+    pub default_maxmemory: u32,
 
     /// Default memory slots per SB/VM.
     ///
@@ -553,11 +689,17 @@ pub struct MemoryInfo {
 
     /// Enable huge pages for VM RAM, default false
     ///
-    /// Enabling this will result in the VM memory being allocated using huge pages. This is useful
-    /// when you want to use vhost-user network stacks within the container. This will automatically
-    /// result in memory pre allocation.
+    /// Enabling this will result in the VM memory being allocated using huge pages.
+    /// Its backend type is specified by item "hugepage_type"
     #[serde(default)]
     pub enable_hugepages: bool,
+
+    /// Select huge page type, default "hugetlbfs"
+    /// Following huge types are supported:
+    /// - hugetlbfs
+    /// - thp
+    #[serde(default)]
+    pub hugepage_type: HugePageType,
 
     /// Specifies virtio-mem will be enabled or not.
     ///
@@ -565,12 +707,6 @@ pub struct MemoryInfo {
     /// "echo 1 > /proc/sys/vm/overcommit_memory".
     #[serde(default)]
     pub enable_virtio_mem: bool,
-
-    /// Enable swap of vm memory. Default false.
-    ///
-    /// The behaviour is undefined if mem_prealloc is also set to true
-    #[serde(default)]
-    pub enable_swap: bool,
 
     /// Enable swap in the guest. Default false.
     ///
@@ -593,6 +729,12 @@ impl MemoryInfo {
             self.file_mem_backend,
             "Memory backend file {} is invalid: {}"
         )?;
+        if self.default_maxmemory == 0 {
+            let s = System::new_all();
+            self.default_maxmemory = Byte::from_u64(s.total_memory())
+                .get_adjusted_unit(Unit::MiB)
+                .get_value() as u32;
+        }
         Ok(())
     }
 
@@ -896,6 +1038,18 @@ impl SharedFsInfo {
     }
 }
 
+/// Configuration information for remote hypervisor type.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct RemoteInfo {
+    /// Remote hypervisor socket path
+    #[serde(default)]
+    pub hypervisor_socket: String,
+
+    /// Remote hyperisor timeout of creating (in seconds)
+    #[serde(default)]
+    pub hypervisor_timeout: i32,
+}
+
 /// Common configuration information for hypervisors.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Hypervisor {
@@ -979,9 +1133,28 @@ pub struct Hypervisor {
     #[serde(default, flatten)]
     pub shared_fs: SharedFsInfo,
 
+    /// Remote hypervisor configuration information.
+    #[serde(default, flatten)]
+    pub remote_info: RemoteInfo,
+
+    /// A sandbox annotation used to specify prefetch_files.list host path container image
+    /// being used, and runtime will pass it to Hypervisor to  search for corresponding
+    /// prefetch list file:
+    ///   prefetch_list_path = /path/to/<uid>/xyz.com/fedora:36/prefetch_file.list
+    #[serde(default)]
+    pub prefetch_list_path: String,
+
     /// Vendor customized runtime configuration.
     #[serde(default, flatten)]
     pub vendor: HypervisorVendor,
+
+    /// Disable applying SELinux on the container process.
+    #[serde(default = "yes")]
+    pub disable_guest_selinux: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 impl Hypervisor {
@@ -1005,6 +1178,10 @@ impl ConfigOps for Hypervisor {
     fn adjust_config(conf: &mut TomlConfig) -> Result<()> {
         HypervisorVendor::adjust_config(conf)?;
         let hypervisors: Vec<String> = conf.hypervisor.keys().cloned().collect();
+        info!(
+            sl!(),
+            "Adjusting hypervisor configuration {:?}", hypervisors
+        );
         for hypervisor in hypervisors.iter() {
             if let Some(plugin) = get_hypervisor_plugin(hypervisor) {
                 plugin.adjust_config(conf)?;
@@ -1022,6 +1199,10 @@ impl ConfigOps for Hypervisor {
                 hv.network_info.adjust_config()?;
                 hv.security_info.adjust_config()?;
                 hv.shared_fs.adjust_config()?;
+                resolve_path!(
+                    hv.prefetch_list_path,
+                    "prefetch_list_path `{}` is invalid: {}"
+                )?;
             } else {
                 return Err(eother!("Can not find plugin for hypervisor {}", hypervisor));
             }
@@ -1056,6 +1237,10 @@ impl ConfigOps for Hypervisor {
                     "Hypervisor control executable `{}` is invalid: {}"
                 )?;
                 validate_path!(hv.jailer_path, "Hypervisor jailer path `{}` is invalid: {}")?;
+                validate_path!(
+                    hv.prefetch_list_path,
+                    "prefetch_files.list path `{}` is invalid: {}"
+                )?;
             } else {
                 return Err(eother!("Can not find plugin for hypervisor {}", hypervisor));
             }

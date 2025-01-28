@@ -15,10 +15,21 @@ The recommended way to create a development environment is to first
 to create a working system.
 
 The installation guide instructions will install all required Kata Containers
-components, plus *Docker*, the hypervisor, and the Kata Containers image and
-guest kernel.
+components, plus a container manager, the hypervisor, and the Kata
+Containers image and guest kernel.
+
+Alternatively, you can perform a
+[manual installation](install/container-manager/containerd/containerd-install.md),
+or continue with [the instructions below](#requirements-to-build-individual-components)
+to build the Kata Containers components from source.
 
 # Requirements to build individual components
+
+> **Note:**
+>
+> If you decide to build from sources, you should be aware of the
+> implications of using an unpackaged system which will not be automatically
+> updated as new [releases](https://github.com/kata-containers/kata-containers/releases) are made available.
 
 You need to install the following to build Kata Containers components:
 
@@ -257,8 +268,10 @@ to install `libseccomp` for the agent.
 
 ```bash
 $ mkdir -p ${seccomp_install_path} ${gperf_install_path}
-$ kata-containers/ci/install_libseccomp.sh ${seccomp_install_path} ${gperf_install_path}
+$ pushd kata-containers/ci 
+$ script -fec 'sudo -E ./install_libseccomp.sh ${seccomp_install_path} ${gperf_install_path}"'
 $ export LIBSECCOMP_LIB_PATH="${seccomp_install_path}/lib"
+$ popd
 ```
 
 On `ppc64le` and `s390x`, `glibc` is used. You will need to install the `libseccomp` library
@@ -437,7 +450,7 @@ You can build and install the guest kernel image as shown [here](../tools/packag
 # Install a hypervisor
 
 When setting up Kata using a [packaged installation method](install/README.md#installing-on-a-linux-system), the
-`QEMU` VMM is installed automatically. Cloud-Hypervisor and Firecracker VMMs are available from the [release tarballs](https://github.com/kata-containers/kata-containers/releases), as well as through [`kata-deploy`](../tools/packaging/kata-deploy/README.md).
+`QEMU` VMM is installed automatically. Cloud-Hypervisor, Firecracker and StratoVirt VMMs are available from the [release tarballs](https://github.com/kata-containers/kata-containers/releases), as well as through [`kata-deploy`](../tools/packaging/kata-deploy/README.md).
 You may choose to manually build your VMM/hypervisor.
 
 ## Build a custom QEMU
@@ -448,7 +461,7 @@ and repository utilized can be found by looking at the [versions file](../versio
 Find the correct version of QEMU from the versions file:
 ```bash
 $ source kata-containers/tools/packaging/scripts/lib.sh
-$ qemu_version="$(get_from_kata_deps "assets.hypervisor.qemu.version")"
+$ qemu_version="$(get_from_kata_deps ".assets.hypervisor.qemu.version")"
 $ echo "${qemu_version}"
 ```
 Get source from the matching branch of QEMU:
@@ -485,19 +498,6 @@ $ popd
 If you do not want to install the respective QEMU version, the configuration file can be modified to point to the correct binary. In `/etc/kata-containers/configuration.toml`, change `path = "/path/to/qemu/build/qemu-system-x86_64"` to point to the correct QEMU binary.
 
 See the [static-build script for QEMU](../tools/packaging/static-build/qemu/build-static-qemu.sh) for a reference on how to get, setup, configure and build QEMU for Kata.
-
-### Build a custom QEMU for aarch64/arm64 - REQUIRED
-> **Note:**
->
-> - You should only do this step if you are on aarch64/arm64.
-> - You should include [Eric Auger's latest PCDIMM/NVDIMM patches](https://patchwork.kernel.org/cover/10647305/) which are
->   under upstream review for supporting NVDIMM on aarch64.
->
-You could build the custom `qemu-system-aarch64` as required with the following command:
-```bash
-$ git clone https://github.com/kata-containers/tests.git
-$ script -fec 'sudo -E tests/.ci/install_qemu.sh'
-```
 
 ## Build `virtiofsd`
 
@@ -587,10 +587,15 @@ $ sudo kata-monitor
 
 #### Connect to debug console
 
-Command `kata-runtime exec` is used to connect to the debug console.
+You need to start a container for example:
+```bash
+$ sudo ctr run  --runtime io.containerd.kata.v2 -d docker.io/library/ubuntu:latest testdebug
+```
+
+Then, you can use the command `kata-runtime exec <sandbox id>` to connect to the debug console.
 
 ```
-$ kata-runtime exec 1a9ab65be63b8b03dfd0c75036d27f0ed09eab38abb45337fea83acd3cd7bacd
+$ kata-runtime exec testdebug
 bash-4.2# id
 uid=0(root) gid=0(root) groups=0(root)
 bash-4.2# pwd
@@ -622,7 +627,7 @@ the following steps (using rootfs or initrd image).
 >
 > Look for `INIT_PROCESS=systemd` in the `config.sh` osbuilder rootfs config file
 > to verify an osbuilder distro supports systemd for the distro you want to build rootfs for.
-> For an example, see the [Clear Linux config.sh file](../tools/osbuilder/rootfs-builder/clearlinux/config.sh).
+> For an example, see the [Ubuntu config.sh file](../tools/osbuilder/rootfs-builder/ubuntu/config.sh).
 >
 > For a non-systemd-based distro, create an equivalent system
 > service using that distro’s init system syntax. Alternatively, you can build a distro
@@ -752,6 +757,11 @@ $ sudo su -c 'cd /var/run/vc/vm/${sandbox_id} && socat "stdin,raw,echo=0,escape=
 
 To disconnect from the virtual machine, type `CONTROL+q` (hold down the
 `CONTROL` key and press `q`).
+
+## Use a debugger with the runtime
+
+For developers interested in using a debugger with the runtime, please
+look at [this document](Debug-shim-guide.md).
 
 ## Obtain details of the image
 

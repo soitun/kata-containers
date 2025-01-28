@@ -7,14 +7,6 @@
 pub mod cgroup_persist;
 mod utils;
 
-use std::{
-    collections::{HashMap, HashSet},
-    error::Error,
-    io,
-    iter::FromIterator,
-    sync::Arc,
-};
-
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use cgroup_persist::CgroupState;
@@ -23,8 +15,18 @@ use hypervisor::Hypervisor;
 use kata_sys_util::spec::load_oci_spec;
 use kata_types::config::TomlConfig;
 use oci::LinuxResources;
+use oci_spec::runtime as oci;
 use persist::sandbox_persist::Persist;
+use std::{
+    collections::{HashMap, HashSet},
+    error::Error,
+    io,
+    iter::FromIterator,
+    sync::Arc,
+};
 use tokio::sync::RwLock;
+
+use crate::ResourceUpdateOp;
 
 const OS_ERROR_NO_SUCH_PROCESS: i32 = 3;
 
@@ -44,9 +46,16 @@ impl CgroupConfig {
         let overhead_path = utils::gen_overhead_path(sid);
         let spec = load_oci_spec()?;
         let path = spec
-            .linux
-            // The trim of '/' is important, because cgroup_path is a relative path.
-            .map(|linux| linux.cgroups_path.trim_start_matches('/').to_string())
+            .linux()
+            .clone()
+            .and_then(|linux| linux.cgroups_path().clone())
+            .map(|path| {
+                // The trim of '/' is important, because cgroup_path is a relative path.
+                path.display()
+                    .to_string()
+                    .trim_start_matches('/')
+                    .to_string()
+            })
             .unwrap_or_default();
 
         Ok(Self {
@@ -149,29 +158,51 @@ impl CgroupsResource {
         &self,
         cid: &str,
         linux_resources: Option<&LinuxResources>,
+        op: ResourceUpdateOp,
         h: &dyn Hypervisor,
     ) -> Result<()> {
-        let resource = self.calc_resource(linux_resources);
-        let changed = self.update_resources(cid, resource).await;
+        let new_resources = self.calc_resource(linux_resources);
+        let old_resources = self.update_resources(cid, new_resources.clone(), op).await;
 
-        if !changed {
-            return Ok(());
-        }
-
-        self.do_update_cgroups(h).await
-    }
-
-    async fn update_resources(&self, cid: &str, new_resource: Resources) -> bool {
-        let mut resources = self.resources.write().await;
-        let old_resource = resources.insert(cid.to_owned(), new_resource.clone());
-
-        if let Some(old_resource) = old_resource {
-            if old_resource == new_resource {
-                return false;
+        if let Some(old_resource) = old_resources.clone() {
+            if old_resource == new_resources {
+                return Ok(());
             }
         }
 
-        true
+        match self.do_update_cgroups(h).await {
+            Err(e) => {
+                // if update failed, we should roll back the records in resources
+                let mut resources = self.resources.write().await;
+                match op {
+                    ResourceUpdateOp::Add => {
+                        resources.remove(cid);
+                    }
+                    ResourceUpdateOp::Update | ResourceUpdateOp::Del => {
+                        if let Some(old_resource) = old_resources {
+                            resources.insert(cid.to_owned(), old_resource);
+                        }
+                    }
+                }
+                Err(e)
+            }
+            Ok(()) => Ok(()),
+        }
+    }
+
+    async fn update_resources(
+        &self,
+        cid: &str,
+        new_resource: Resources,
+        op: ResourceUpdateOp,
+    ) -> Option<Resources> {
+        let mut resources = self.resources.write().await;
+        match op {
+            ResourceUpdateOp::Add | ResourceUpdateOp::Update => {
+                resources.insert(cid.to_owned(), new_resource.clone())
+            }
+            ResourceUpdateOp::Del => resources.remove(cid),
+        }
     }
 
     async fn do_update_cgroups(&self, h: &dyn Hypervisor) -> Result<()> {
@@ -232,11 +263,17 @@ impl CgroupsResource {
     }
 
     fn calc_cpu_resources(&self, linux_resources: Option<&LinuxResources>) -> CpuResources {
-        let cpu = || -> Option<oci::LinuxCpu> { linux_resources.as_ref()?.cpu.clone() }();
+        let cpus = linux_resources
+            .and_then(|res| res.cpu().clone())
+            .and_then(|cpu| cpu.cpus().clone());
+
+        let mems = linux_resources
+            .and_then(|res| res.cpu().clone())
+            .and_then(|cpu| cpu.mems().clone());
 
         CpuResources {
-            cpus: cpu.clone().map(|cpu| cpu.cpus),
-            mems: cpu.map(|cpu| cpu.mems),
+            cpus,
+            mems,
             ..Default::default()
         }
     }

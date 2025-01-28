@@ -28,33 +28,39 @@ __Steps from the Developer Guide:__
 __SNP-specific steps:__
 - Build the SNP-specific kernel as shown below (see this [guide](../../tools/packaging/kernel/README.md#build-kata-containers-kernel) for more information)
 ```bash
-$ pushd kata-containers/tools/packaging/kernel/
-$ ./build-kernel.sh -a x86_64 -x snp setup
-$ ./build-kernel.sh -a x86_64 -x snp build
-$ sudo -E PATH="${PATH}" ./build-kernel.sh -x snp install
+$ pushd kata-containers/tools/packaging/
+$ ./kernel/build-kernel.sh -a x86_64 -x setup
+$ ./kernel/build-kernel.sh -a x86_64 -x build
+$ sudo -E PATH="${PATH}" ./kernel/build-kernel.sh -x install
 $ popd
 ```
 - Build a current OVMF capable of SEV-SNP:
 ```bash
 $ pushd kata-containers/tools/packaging/static-build/ovmf
-$ ./build.sh
-$ tar -xvf edk2-x86_64.tar.gz
+$ ovmf_build=sev ./build.sh
+$ tar -xvf edk2-sev.tar.gz
 $ popd
 ```
 - Build a custom QEMU
 ```bash
 $ source kata-containers/tools/packaging/scripts/lib.sh
-$ qemu_url="$(get_from_kata_deps "assets.hypervisor.qemu.snp.url")"
-$ qemu_branch="$(get_from_kata_deps "assets.hypervisor.qemu.snp.branch")"
-$ qemu_commit="$(get_from_kata_deps "assets.hypervisor.qemu.snp.commit")"
-$ git clone -b "${qemu_branch}" "${qemu_url}"
+$ qemu_url="$(get_from_kata_deps ".assets.hypervisor.qemu-snp-experimental.url")"
+$ qemu_tag="$(get_from_kata_deps ".assets.hypervisor.qemu-snp-experimental.tag")"
+$ git clone "${qemu_url}"
 $ pushd qemu
-$ git checkout "${qemu_commit}"
+$ git checkout "${qemu_tag}"
 $ ./configure --enable-virtfs --target-list=x86_64-softmmu --enable-debug
 $ make -j "$(nproc)"
 $ popd
 ```
-
+- Create cert-chain for SNP attestation ( using [snphost](https://github.com/virtee/snphost/blob/main/docs/snphost.1.adoc) )
+```bash
+$ git clone https://github.com/virtee/snphost.git && cd snphost/
+$ cargo build
+$ mkdir /tmp/certs
+$ ./target/debug/snphost fetch vcek der /tmp/certs
+$ ./target/debug/snphost import /tmp/certs /opt/snp/cert_chain.cert
+```
 ### Kata Containers Configuration for SNP
 
 The configuration file located at `/etc/kata-containers/configuration.toml` must be adapted as follows to support SNP-VMs:
@@ -100,7 +106,11 @@ sev_snp_guest = true
 ```
   - Configure an OVMF (add path)
 ```toml
-firmware = "/path/to/kata-containers/tools/packaging/static-build/ovmf/opt/kata/share/ovmf/OVMF.fd"
+firmware = "/path/to/kata-containers/tools/packaging/static-build/ovmf/opt/kata/share/ovmf/AMDSEV.fd"
+```
+  - SNP attestation (add cert-chain to default path or add the path with cert-chain)
+```toml
+snp_certs_path = "/path/to/cert-chain"
 ```
 
 ## Test Kata Containers with Containerd

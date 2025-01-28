@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/config"
 	govmmQemu "github.com/kata-containers/kata-containers/src/runtime/pkg/govmm/qemu"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
 	"github.com/sirupsen/logrus"
@@ -25,7 +26,7 @@ const defaultQemuPath = "/usr/bin/qemu-system-ppc64"
 
 const defaultQemuMachineType = QemuPseries
 
-const defaultQemuMachineOptions = "accel=kvm,usb=off"
+const defaultQemuMachineOptions = "accel=kvm,usb=off,cap-ail-mode-3=off"
 
 const qmpMigrationWaitTimeout = 5 * time.Second
 
@@ -97,16 +98,19 @@ func newQemuArch(config HypervisorConfig) (qemuArch, error) {
 	return q, nil
 }
 
-func (q *qemuPPC64le) capabilities() types.Capabilities {
+func (q *qemuPPC64le) capabilities(hConfig HypervisorConfig) types.Capabilities {
 	var caps types.Capabilities
 
 	// pseries machine type supports hotplugging drives
 	if q.qemuMachine.Type == QemuPseries {
 		caps.SetBlockDeviceHotplugSupport()
+		caps.SetNetworkDeviceHotplugSupported()
 	}
 
 	caps.SetMultiQueueSupport()
-	caps.SetFsSharingSupport()
+	if hConfig.SharedFS != config.NoSharedFS {
+		caps.SetFsSharingSupport()
+	}
 
 	return caps
 }

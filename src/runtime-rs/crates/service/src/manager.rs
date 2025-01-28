@@ -4,83 +4,49 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-use std::{
-    fs,
-    os::unix::io::{FromRawFd, RawFd},
-    process::Stdio,
-    sync::Arc,
-};
+use std::fs;
+use std::os::unix::io::{FromRawFd, RawFd};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use common::message::{Action, Event, Message};
-use containerd_shim_protos::{
-    protobuf::{well_known_types::Any, Message as ProtobufMessage},
-    shim_async,
-};
+use common::message::{Action, Message};
+use containerd_shim_protos::shim_async;
+use kata_types::config::KATA_PATH;
 use runtimes::RuntimeHandlerManager;
-use tokio::{
-    io::AsyncWriteExt,
-    process::Command,
-    sync::mpsc::{channel, Receiver},
-};
+use tokio::sync::mpsc::{channel, Receiver};
 use ttrpc::asynchronous::Server;
 
+use crate::event::{new_event_publisher, Forwarder};
 use crate::task_service::TaskService;
+
 /// message buffer size
 const MESSAGE_BUFFER_SIZE: usize = 8;
-use shim_interface::KATA_PATH;
 
 pub struct ServiceManager {
     receiver: Option<Receiver<Message>>,
     handler: Arc<RuntimeHandlerManager>,
-    task_server: Option<Server>,
+    server: Option<Server>,
     binary: String,
     address: String,
     namespace: String,
+    event_publisher: Box<dyn Forwarder>,
 }
 
-async fn send_event(
-    containerd_binary: String,
-    address: String,
-    namespace: String,
-    event: Arc<dyn Event>,
-) -> Result<()> {
-    let any = Any {
-        type_url: event.type_url(),
-        value: event.value().context("get event value")?,
-        ..Default::default()
-    };
-    let data = any.write_to_bytes().context("write to any")?;
-    let mut child = Command::new(containerd_binary)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .args([
-            "--address",
-            &address,
-            "publish",
-            "--topic",
-            &event.r#type(),
-            "--namespace",
-            &namespace,
-        ])
-        .spawn()
-        .context("spawn containerd cmd to publish event")?;
-
-    let stdin = child.stdin.as_mut().context("failed to open stdin")?;
-    stdin
-        .write_all(&data)
-        .await
-        .context("failed to write to stdin")?;
-    let output = child
-        .wait_with_output()
-        .await
-        .context("failed to read stdout")?;
-    info!(sl!(), "get output: {:?}", output);
-    Ok(())
+impl std::fmt::Debug for ServiceManager {
+    // todo: some how to implement debug for handler
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServiceManager")
+            .field("receiver", &self.receiver)
+            .field("server.is_some()", &self.server.is_some())
+            .field("binary", &self.binary)
+            .field("address", &self.address)
+            .field("namespace", &self.namespace)
+            .finish()
+    }
 }
 
 impl ServiceManager {
+    // TODO: who manages lifecycle for `task_server_fd`?
     pub async fn new(
         id: &str,
         containerd_binary: &str,
@@ -88,27 +54,33 @@ impl ServiceManager {
         namespace: &str,
         task_server_fd: RawFd,
     ) -> Result<Self> {
+        // Regist service logger for later use.
+        logging::register_subsystem_logger("runtimes", "service");
+
         let (sender, receiver) = channel::<Message>(MESSAGE_BUFFER_SIZE);
-        let handler = Arc::new(
-            RuntimeHandlerManager::new(id, sender)
-                .await
-                .context("new runtime handler")?,
-        );
-        let mut task_server = unsafe { Server::from_raw_fd(task_server_fd) };
-        task_server = task_server.set_domain_unix();
+        let rt_mgr = RuntimeHandlerManager::new(id, sender).context("new runtime handler")?;
+        let handler = Arc::new(rt_mgr);
+        let mut server = unsafe { Server::from_raw_fd(task_server_fd) };
+        server = server.set_domain_unix();
+        let event_publisher = new_event_publisher(namespace)
+            .await
+            .context("new event publisher")?;
+
         Ok(Self {
             receiver: Some(receiver),
             handler,
-            task_server: Some(task_server),
+            server: Some(server),
             binary: containerd_binary.to_string(),
             address: address.to_string(),
             namespace: namespace.to_string(),
+            event_publisher,
         })
     }
 
-    pub async fn run(&mut self) -> Result<()> {
+    pub async fn run(mut self) -> Result<()> {
         info!(sl!(), "begin to run service");
-        self.start().await.context("start")?;
+        self.registry_service().context("registry service")?;
+        self.start_service().await.context("start service")?;
 
         info!(sl!(), "wait server message");
         let mut rx = self.receiver.take();
@@ -116,23 +88,18 @@ impl ServiceManager {
             while let Some(r) = rx.recv().await {
                 info!(sl!(), "receive action {:?}", &r.action);
                 let result = match r.action {
-                    Action::Start => self.start().await.context("start listen"),
-                    Action::Stop => self.stop_listen().await.context("stop listen"),
+                    Action::Start => self.start_service().await.context("start listen"),
+                    Action::Stop => self.stop_service().await.context("stop listen"),
                     Action::Shutdown => {
-                        self.stop_listen().await.context("stop listen")?;
+                        self.stop_service().await.context("stop listen")?;
                         break;
                     }
                     Action::Event(event) => {
                         info!(sl!(), "get event {:?}", &event);
-                        send_event(
-                            self.binary.clone(),
-                            self.address.clone(),
-                            self.namespace.clone(),
-                            event,
-                        )
-                        .await
-                        .context("send event")?;
-                        Ok(())
+                        self.event_publisher
+                            .forward(event)
+                            .await
+                            .context("forward event")
                     }
                 };
 
@@ -152,49 +119,43 @@ impl ServiceManager {
 
     pub async fn cleanup(sid: &str) -> Result<()> {
         let (sender, _receiver) = channel::<Message>(MESSAGE_BUFFER_SIZE);
-        let handler = RuntimeHandlerManager::new(sid, sender)
-            .await
-            .context("new runtime handler")?;
-        handler.cleanup().await.context("runtime handler cleanup")?;
+        let handler = RuntimeHandlerManager::new(sid, sender).context("new runtime handler")?;
+        if let Err(e) = handler.cleanup().await {
+            warn!(sl!(), "failed to clean up runtime state, {}", e);
+        }
+
         let temp_dir = [KATA_PATH, sid].join("/");
-        if std::fs::metadata(temp_dir.as_str()).is_ok() {
+        if fs::metadata(temp_dir.as_str()).is_ok() {
             // try to remove dir and skip the result
-            fs::remove_dir_all(temp_dir)
-                .map_err(|err| {
-                    warn!(sl!(), "failed to clean up sandbox tmp dir");
-                    err
-                })
-                .ok();
+            if let Err(e) = fs::remove_dir_all(temp_dir) {
+                warn!(sl!(), "failed to clean up sandbox tmp dir, {}", e);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn registry_service(&mut self) -> Result<()> {
+        if let Some(t) = self.server.take() {
+            let task_service = Arc::new(Box::new(TaskService::new(self.handler.clone()))
+                as Box<dyn shim_async::Task + Send + Sync>);
+            let t = t.register_service(shim_async::create_task(task_service));
+            self.server = Some(t);
         }
         Ok(())
     }
 
-    async fn start(&mut self) -> Result<()> {
-        let task_service = Arc::new(Box::new(TaskService::new(self.handler.clone()))
-            as Box<dyn shim_async::Task + Send + Sync>);
-        let task_server = self.task_server.take();
-        let task_server = match task_server {
-            Some(t) => {
-                let mut t = t.register_service(shim_async::create_task(task_service));
-                t.start().await.context("task server start")?;
-                Some(t)
-            }
-            None => None,
-        };
-        self.task_server = task_server;
+    async fn start_service(&mut self) -> Result<()> {
+        if let Some(t) = self.server.as_mut() {
+            t.start().await.context("task server start")?;
+        }
         Ok(())
     }
 
-    async fn stop_listen(&mut self) -> Result<()> {
-        let task_server = self.task_server.take();
-        let task_server = match task_server {
-            Some(mut t) => {
-                t.stop_listen().await;
-                Some(t)
-            }
-            None => None,
-        };
-        self.task_server = task_server;
+    async fn stop_service(&mut self) -> Result<()> {
+        if let Some(t) = self.server.as_mut() {
+            t.stop_listen().await;
+        }
         Ok(())
     }
 }

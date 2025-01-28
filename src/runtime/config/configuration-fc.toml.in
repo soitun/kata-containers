@@ -127,11 +127,6 @@ block_device_driver = "@DEFBLOCKSTORAGEDRIVER_FC@"
 #block_device_cache_set = true
 
 # Specifies cache-related options for block devices.
-# Denotes whether use of O_DIRECT (bypass the host page cache) is enabled.
-# Default false
-#block_device_cache_direct = true
-
-# Specifies cache-related options for block devices.
 # Denotes whether flush requests for the device are ignored.
 # Default false
 #block_device_cache_noflush = true
@@ -284,8 +279,12 @@ kernel_modules=[]
 #debug_console_enabled = true
 
 # Agent connection dialing timeout value in seconds
-# (default: 30)
-#dial_timeout = 30
+# (default: 45)
+dial_timeout = 45
+
+# Confidential Data Hub API timeout value in seconds
+# (default: 50)
+#cdh_api_timeout = 50
 
 [runtime]
 # If enabled, the runtime will log additional debug messages to the
@@ -372,3 +371,20 @@ experimental=@DEFAULTEXPFEATURES@
 # If enabled, user can run pprof tools with shim v2 process through kata-monitor.
 # (default: false)
 # enable_pprof = true
+
+# Indicates the CreateContainer request timeout needed for the workload(s)
+# It using guest_pull this includes the time to pull the image inside the guest
+# Defaults to @DEFCREATECONTAINERTIMEOUT@ second(s)  
+# Note: The effective timeout is determined by the lesser of two values: runtime-request-timeout from kubelet config 
+# (https://kubernetes.io/docs/reference/command-line-tools-reference/kubelet/#:~:text=runtime%2Drequest%2Dtimeout) and create_container_timeout. 
+# In essence, the timeout used for guest pull=runtime-request-timeout<create_container_timeout?runtime-request-timeout:create_container_timeout.
+create_container_timeout = @DEFCREATECONTAINERTIMEOUT@
+
+# Base directory of directly attachable network config.
+# Network devices for VM-based containers are allowed to be placed in the
+# host netns to eliminate as many hops as possible, which is what we
+# called a "Directly Attachable Network". The config, set by special CNI
+# plugins, is used to tell the Kata containers what devices are attached
+# to the hypervisor.
+# (default: /run/kata-containers/dans)
+dan_conf = "@DEFDANCONF@"

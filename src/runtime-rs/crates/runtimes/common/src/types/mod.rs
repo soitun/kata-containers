@@ -8,18 +8,25 @@ mod trans_from_agent;
 mod trans_from_shim;
 mod trans_into_agent;
 mod trans_into_shim;
+pub mod utils;
 
-use std::fmt;
+use std::{
+    collections::{hash_map::RandomState, HashMap},
+    fmt,
+};
+
+use crate::SandboxNetworkEnv;
 
 use anyhow::{Context, Result};
 use kata_sys_util::validate;
 use kata_types::mount::Mount;
+use oci_spec::runtime as oci;
 use strum::Display;
 
-/// Request: request from shim
-/// Request and Response messages need to be paired
+/// TaskRequest: TaskRequest from shim
+/// TaskRequest and TaskResponse messages need to be paired
 #[derive(Debug, Clone, Display)]
-pub enum Request {
+pub enum TaskRequest {
     CreateContainer(ContainerConfig),
     CloseProcessIO(ContainerProcess),
     DeleteProcess(ContainerProcess),
@@ -38,10 +45,10 @@ pub enum Request {
     ConnectContainer(ContainerID),
 }
 
-/// Response: response to shim
-/// Request and Response messages need to be paired
+/// TaskResponse: TaskResponse to shim
+/// TaskRequest and TaskResponse messages need to be paired
 #[derive(Debug, Clone, Display)]
-pub enum Response {
+pub enum TaskResponse {
     CreateContainer(PID),
     CloseProcessIO,
     DeleteProcess(ProcessStateInfo),
@@ -134,6 +141,17 @@ pub struct ContainerConfig {
     pub stderr: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+pub struct SandboxConfig {
+    pub sandbox_id: String,
+    pub hostname: String,
+    pub dns: Vec<String>,
+    pub network_env: SandboxNetworkEnv,
+    pub annotations: HashMap<String, String, RandomState>,
+    pub hooks: Option<oci::Hooks>,
+    pub state: runtime_spec::State,
+}
+
 #[derive(Debug, Clone)]
 pub struct PID {
     pub pid: u32,
@@ -184,7 +202,6 @@ pub enum ProcessStatus {
     Stopped = 3,
     Paused = 4,
     Pausing = 5,
-    Exited = 6,
 }
 
 #[derive(Debug, Clone)]

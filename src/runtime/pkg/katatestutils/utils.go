@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"testing"
 
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/config"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/stretchr/testify/assert"
 )
@@ -223,7 +224,10 @@ type RuntimeConfigOptions struct {
 	JaegerUser           string
 	JaegerPassword       string
 	PFlash               []string
+	HotPlugVFIO          config.PCIePort
+	ColdPlugVFIO         config.PCIePort
 	PCIeRootPort         uint32
+	PCIeSwitchPort       uint32
 	DefaultVCPUCount     uint32
 	DefaultMaxVCPUCount  uint32
 	DefaultMemSize       uint32
@@ -231,7 +235,6 @@ type RuntimeConfigOptions struct {
 	DefaultMsize9p       uint32
 	DisableBlock         bool
 	EnableIOThreads      bool
-	HotplugVFIOOnRootBus bool
 	DisableNewNetNs      bool
 	HypervisorDebug      bool
 	RuntimeDebug         bool
@@ -315,8 +318,10 @@ func MakeRuntimeConfigFileData(config RuntimeConfigOptions) string {
 	default_memory = ` + strconv.FormatUint(uint64(config.DefaultMemSize), 10) + `
 	disable_block_device_use =  ` + strconv.FormatBool(config.DisableBlock) + `
 	enable_iothreads =  ` + strconv.FormatBool(config.EnableIOThreads) + `
-	hotplug_vfio_on_root_bus =  ` + strconv.FormatBool(config.HotplugVFIOOnRootBus) + `
+	cold_plug_vfio =  "` + config.ColdPlugVFIO.String() + `"
+	hot_plug_vfio =   "` + config.HotPlugVFIO.String() + `"
 	pcie_root_port = ` + strconv.FormatUint(uint64(config.PCIeRootPort), 10) + `
+	pcie_switch_port = ` + strconv.FormatUint(uint64(config.PCIeSwitchPort), 10) + `
 	msize_9p = ` + strconv.FormatUint(uint64(config.DefaultMsize9p), 10) + `
 	enable_debug = ` + strconv.FormatBool(config.HypervisorDebug) + `
 	guest_hook_path = "` + config.DefaultGuestHookPath + `"

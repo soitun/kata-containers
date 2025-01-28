@@ -38,6 +38,9 @@ build_root=$(mktemp -d)
 pushd $build_root
 git clone --single-branch --depth 1 -b "${ovmf_version}" "${ovmf_repo}"
 cd "${ovmf_dir}"
+# TODO: Remove this line after bumping to a newer release of OVMF.
+# Reference: https://github.com/tianocore/edk2/pull/6402
+sed -i -e "s|https://github.com/Zeex/subhook.git|https://github.com/tianocore/edk2-subhook.git|g" .gitmodules
 git submodule init
 git submodule update
 
@@ -56,7 +59,7 @@ fi
 info "Building ovmf"
 build_cmd="build -b ${build_target} -t ${toolchain} -a ${architecture} -p ${ovmf_package}"
 if [ "${ovmf_build}" == "tdx" ]; then
-	build_cmd+=" -D DEBUG_ON_SERIAL_PORT=TRUE -D TDX_MEM_PARTIAL_ACCEPT=512 -D TDX_EMULATION_ENABLE=FALSE -D TDX_ACCEPT_PAGE_SIZE=2M"
+	build_cmd+=" -D SECURE_BOOT_ENABLE=TRUE"
 fi
 
 eval "${build_cmd}"
@@ -70,7 +73,6 @@ if [ "${ovmf_build}" == "tdx" ]; then
 	build_path_arch="${build_path_target_toolchain}/X64"
 	stat "${build_path_fv}/OVMF_CODE.fd"
 	stat "${build_path_fv}/OVMF_VARS.fd"
-	stat "${build_path_arch}/DumpTdxEventLog.efi"
 fi
 
 #need to leave tmp dir
@@ -78,16 +80,16 @@ popd
 
 info "Install fd to destdir"
 install_dir="${DESTDIR}/${PREFIX}/share/ovmf"
-if [ "${ovmf_build}" == "tdx" ]; then
-	install_dir="$DESTDIR/$PREFIX/share/tdvf"
-fi
 
 mkdir -p "${install_dir}"
-install $build_root/$ovmf_dir/"${build_path_fv}"/OVMF.fd "${install_dir}"
+if [ "${ovmf_build}" == "sev" ]; then
+	install $build_root/$ovmf_dir/"${build_path_fv}"/OVMF.fd "${install_dir}/AMDSEV.fd"
+else
+	install $build_root/$ovmf_dir/"${build_path_fv}"/OVMF.fd "${install_dir}"
+fi
 if [ "${ovmf_build}" == "tdx" ]; then
 	install $build_root/$ovmf_dir/"${build_path_fv}"/OVMF_CODE.fd ${install_dir}
 	install $build_root/$ovmf_dir/"${build_path_fv}"/OVMF_VARS.fd ${install_dir}
-	install $build_root/$ovmf_dir/"${build_path_arch}"/DumpTdxEventLog.efi ${install_dir}
 fi
 
 local_dir=${PWD}

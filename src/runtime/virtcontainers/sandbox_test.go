@@ -126,7 +126,7 @@ func TestCalculateSandboxCPUs(t *testing.T) {
 	tests := []struct {
 		name       string
 		containers []ContainerConfig
-		want       uint32
+		want       float32
 	}{
 		{"1-unconstrained", []ContainerConfig{unconstrained}, 0},
 		{"2-unconstrained", []ContainerConfig{unconstrained, unconstrained}, 0},
@@ -593,11 +593,11 @@ func TestSandboxAttachDevicesVFIO(t *testing.T) {
 	_, err = os.Create(deviceFile)
 	assert.Nil(t, err)
 
-	savedIOMMUPath := config.SysIOMMUPath
-	config.SysIOMMUPath = tmpDir
+	savedIOMMUPath := config.SysIOMMUGroupPath
+	config.SysIOMMUGroupPath = tmpDir
 
 	defer func() {
-		config.SysIOMMUPath = savedIOMMUPath
+		config.SysIOMMUGroupPath = savedIOMMUPath
 	}()
 
 	dm := manager.NewDeviceManager(config.VirtioSCSI, false, "", 0, nil)
@@ -606,6 +606,7 @@ func TestSandboxAttachDevicesVFIO(t *testing.T) {
 		HostPath:      path,
 		ContainerPath: path,
 		DevType:       "c",
+		Port:          config.RootPort,
 	}
 	dev, err := dm.NewDevice(deviceInfo)
 	assert.Nil(t, err, "deviceManager.NewDevice return error: %v", err)
@@ -672,17 +673,15 @@ func TestSandboxCreateAssets(t *testing.T) {
 	originalInitrdPath := filepath.Join(testDir, testInitrd)
 	originalFirmwarePath := filepath.Join(testDir, testFirmware)
 	originalHypervisorPath := filepath.Join(testDir, testHypervisor)
-	originalHypervisorCtlPath := filepath.Join(testDir, testHypervisorCtl)
 	originalJailerPath := filepath.Join(testDir, testJailer)
 
 	hc := HypervisorConfig{
-		KernelPath:        originalKernelPath,
-		ImagePath:         originalImagePath,
-		InitrdPath:        originalInitrdPath,
-		FirmwarePath:      originalFirmwarePath,
-		HypervisorPath:    originalHypervisorPath,
-		HypervisorCtlPath: originalHypervisorCtlPath,
-		JailerPath:        originalJailerPath,
+		KernelPath:     originalKernelPath,
+		ImagePath:      originalImagePath,
+		InitrdPath:     originalInitrdPath,
+		FirmwarePath:   originalFirmwarePath,
+		HypervisorPath: originalHypervisorPath,
+		JailerPath:     originalJailerPath,
 	}
 
 	data := []testData{
@@ -698,13 +697,6 @@ func TestSandboxCreateAssets(t *testing.T) {
 			map[string]string{
 				annotations.HypervisorPath: filename,
 				annotations.HypervisorHash: assetContentHash,
-			},
-		},
-		{
-			types.HypervisorCtlAsset,
-			map[string]string{
-				annotations.HypervisorCtlPath: filename,
-				annotations.HypervisorCtlHash: assetContentHash,
 			},
 		},
 		{
@@ -770,6 +762,24 @@ func TestSandboxCreateAssets(t *testing.T) {
 		err = createAssets(context.Background(), config)
 		assert.Error(err, msg)
 	}
+
+	// Remote Hypervisor scenario for ImagePath
+	msg := "test[image]: imagePath"
+	imagePathData := &testData{
+		assetType: types.ImageAsset,
+		annotations: map[string]string{
+			annotations.ImagePath: "rhel9-os",
+		},
+	}
+
+	config := &SandboxConfig{
+		Annotations:      imagePathData.annotations,
+		HypervisorConfig: hc,
+		HypervisorType:   RemoteHypervisor,
+	}
+
+	err = createAssets(context.Background(), config)
+	assert.NoError(err, msg)
 }
 
 func testFindContainerFailure(t *testing.T, sandbox *Sandbox, cid string) {

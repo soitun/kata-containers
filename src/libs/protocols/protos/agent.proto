@@ -38,6 +38,7 @@ service AgentService {
 	rpc StatsContainer(StatsContainerRequest) returns (StatsContainerResponse);
 	rpc PauseContainer(PauseContainerRequest) returns (google.protobuf.Empty);
 	rpc ResumeContainer(ResumeContainerRequest) returns (google.protobuf.Empty);
+	rpc RemoveStaleVirtiofsShareMounts(RemoveStaleVirtiofsShareMountsRequest) returns (google.protobuf.Empty);
 
 	// stdio
 	rpc WriteStdin(WriteStreamRequest) returns (WriteStreamResponse);
@@ -58,6 +59,10 @@ service AgentService {
 	// observability
 	rpc GetMetrics(GetMetricsRequest) returns (Metrics);
 
+	// mem-agent
+	rpc MemAgentMemcgSet(MemAgentMemcgConfig) returns (google.protobuf.Empty);
+	rpc MemAgentCompactSet(MemAgentCompactConfig) returns (google.protobuf.Empty);
+
 	// misc (TODO: some rpcs can be replaced by hyperstart-exec)
 	rpc CreateSandbox(CreateSandboxRequest) returns (google.protobuf.Empty);
 	rpc DestroySandbox(DestroySandboxRequest) returns (google.protobuf.Empty);
@@ -71,6 +76,7 @@ service AgentService {
 	rpc AddSwap(AddSwapRequest) returns (google.protobuf.Empty);
 	rpc GetVolumeStats(VolumeStatsRequest) returns (VolumeStatsResponse);
 	rpc ResizeVolume(ResizeVolumeRequest) returns (google.protobuf.Empty);
+	rpc SetPolicy(SetPolicyRequest) returns (google.protobuf.Empty);
 }
 
 message CreateContainerRequest {
@@ -87,6 +93,18 @@ message CreateContainerRequest {
 	// The agent would receive an OCI spec with PID namespace cleared
 	// out altogether and not just the pid ns path.
 	bool sandbox_pidns = 7;
+
+	// This field is used to declare a set of shared mount points
+	// that support cross-container sharing of mount objects.
+	repeated SharedMount shared_mounts = 8;
+
+	// These fields are the host-side vport numbers of passfd streams
+	// pre-created by runtime-rs, and used as identifiers for the agent
+	// to select the right streams for init process's stdin/stdout/stderr.
+	// Disable the feature by setting the associated port to 0.
+	uint32 stdin_port = 9;
+	uint32 stdout_port = 10;
+	uint32 stderr_port = 11;
 }
 
 message StartContainerRequest {
@@ -109,6 +127,14 @@ message ExecProcessRequest {
 	string exec_id = 2;
 	StringUser string_user = 3;
 	Process process = 4;
+
+	// These fields are the host-side vport numbers of passfd streams
+	// pre-created by runtime-rs, and used as identifiers for the agent
+	// to select the right streams for process's stdin/stdout/stderr.
+	// Disable the feature by setting the associated port to 0.
+	uint32 stdin_port = 5;
+	uint32 stdout_port = 6;
+	uint32 stderr_port = 7;
 }
 
 message SignalProcessRequest {
@@ -301,6 +327,8 @@ message CreateSandboxRequest {
 message DestroySandboxRequest {
 }
 
+message RemoveStaleVirtiofsShareMountsRequest {}
+
 message Interfaces {
 	repeated types.Interface Interfaces = 1;
 }
@@ -363,7 +391,8 @@ message OnlineCPUMemRequest {
 	// resources are connected asynchronously and the agent returns immediately.
 	bool wait = 1;
 
-	// NbCpus specifies the number of CPUs that were added and the agent has to online.
+	// NbCpus specifies the number of CPUs that should be onlined in the guest.
+	// Special value 0 means agent will skip this check.
 	uint32 nb_cpus = 2;
 
 	// CpuOnly specifies whether only online CPU or not.
@@ -392,6 +421,9 @@ message AgentDetails {
 	// Set only if the agent is built with seccomp support and the guest
 	// environment supports seccomp.
 	bool supports_seccomp = 5;
+
+	// List of additional features enabled at agent build time.
+	repeated string extra_features = 6;
 }
 
 message GuestDetailsRequest {
@@ -437,6 +469,23 @@ message FSGroup {
 	// GroupChangePolicy specifies the policy for applying group id
 	// ownership change on a mounted volume.
 	types.FSGroupChangePolicy group_change_policy = 3;
+}
+
+// SharedMount declares a set of shared mount points that support
+// cross-container sharing of mount objects.
+message SharedMount {
+	// Name is used to identify a pair of shared mount points.
+	string name = 1;
+	// Src_ctr is used to specify the name of the source container.
+	string src_ctr = 2;
+	// Src_path is used to specify the path of the mount point. If the path doesn't
+	// exist in the rootfs, it will be created.
+	string src_path = 3;
+	// Dst_ctr is used to specify the name of the destination container.
+	string dst_ctr = 4;
+	// Dst_path is used to specify the path of the mount point. If the path doesn't
+	// exist in the rootfs, it will be created.
+	string dst_path = 5;
 }
 
 // Storage represents both the rootfs of the container, and any volume that
@@ -561,4 +610,29 @@ message ResizeVolumeRequest {
 	// Full VM guest path of the volume (outside the container)
 	string volume_guest_path = 1;
 	uint64 size = 2;
+}
+
+message SetPolicyRequest {
+	string policy = 1;
+}
+
+message MemAgentMemcgConfig {
+	optional bool disabled = 1;
+	optional bool swap = 2;
+	optional uint32 swappiness_max = 3;
+	optional uint64 period_secs = 4;
+	optional uint32 period_psi_percent_limit = 5;
+	optional uint32 eviction_psi_percent_limit = 6;
+	optional uint64 eviction_run_aging_count_min = 7;
+}
+
+message MemAgentCompactConfig {
+	optional bool disabled = 1;
+	optional uint64 period_secs = 2;
+	optional uint32 period_psi_percent_limit = 3;
+	optional uint32 compact_psi_percent_limit = 4;
+	optional int64 compact_sec_max = 5;
+	optional uint32 compact_order = 6;
+	optional uint64 compact_threshold = 7;
+	optional uint64 compact_force_times = 8;
 }

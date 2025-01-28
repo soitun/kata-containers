@@ -7,12 +7,13 @@
 use agent::Storage;
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use kata_sys_util::mount::{bind_remount, umount_all, umount_timeout};
+use kata_sys_util::mount::{
+    bind_remount, get_mount_path, get_mount_type, umount_all, umount_timeout,
+};
 use kata_types::k8s::is_watchable_mount;
 use kata_types::mount;
 use nix::sys::stat::stat;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 const WATCHABLE_PATH_NAME: &str = "watchable";
@@ -21,7 +22,10 @@ pub const EPHEMERAL_PATH: &str = "/run/kata-containers/sandbox/ephemeral";
 
 use super::{
     get_host_rw_shared_path,
-    utils::{self, do_get_host_path, get_host_ro_shared_path, get_host_shared_path},
+    utils::{
+        self, do_get_host_path, get_host_ro_shared_path, get_host_shared_path,
+        mkdir_with_permissions,
+    },
     ShareFsMount, ShareFsMountResult, ShareFsRootfsConfig, ShareFsVolumeConfig,
     KATA_GUEST_SHARE_DIR, PASSTHROUGH_FS_DIR,
 };
@@ -79,12 +83,10 @@ impl ShareFsMount for VirtiofsShareMount {
                 .join(PASSTHROUGH_FS_DIR)
                 .join(WATCHABLE_PATH_NAME);
 
-            fs::create_dir_all(&watchable_host_path).context(format!(
-                "unable to create watchable path: {:?}",
-                &watchable_host_path,
+            mkdir_with_permissions(watchable_host_path.clone(), 0o750).context(format!(
+                "unable to create watchable path {:?}",
+                watchable_host_path
             ))?;
-
-            fs::set_permissions(watchable_host_path, fs::Permissions::from_mode(0o750))?;
 
             // path: /run/kata-containers/shared/containers/passthrough/watchable/config-map-name
             let file_name = Path::new(&guest_path)
@@ -118,11 +120,11 @@ impl ShareFsMount for VirtiofsShareMount {
                 guest_path,
                 storages,
             });
-        } else if config.mount.r#type == mount::KATA_EPHEMERAL_VOLUME_TYPE {
+        } else if get_mount_type(&config.mount).as_str() == mount::KATA_EPHEMERAL_VOLUME_TYPE {
             // refer to the golang `handleEphemeralStorage` code at
             // https://github.com/kata-containers/kata-containers/blob/9516286f6dd5cfd6b138810e5d7c9e01cf6fc043/src/runtime/virtcontainers/kata_agent.go#L1354
 
-            let source = &config.mount.source;
+            let source = &get_mount_path(config.mount.source());
             let file_stat =
                 stat(Path::new(source)).with_context(|| format!("mount source {}", source))?;
 

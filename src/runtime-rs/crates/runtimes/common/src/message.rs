@@ -6,7 +6,8 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use containerd_shim_protos::{events::task::TaskOOM, protobuf::Message as ProtobufMessage};
+use containerd_shim_protos::events::task::{TaskExit, TaskOOM};
+use containerd_shim_protos::protobuf::Message as ProtobufMessage;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 
 /// message receiver buffer size
@@ -47,6 +48,10 @@ impl Message {
 }
 
 const TASK_OOM_EVENT_TOPIC: &str = "/tasks/oom";
+const TASK_EXIT_EVENT_TOPIC: &str = "/tasks/exit";
+
+const TASK_OOM_EVENT_URL: &str = "containerd.events.TaskOOM";
+const TASK_EXIT_EVENT_URL: &str = "containerd.events.TaskExit";
 
 pub trait Event: std::fmt::Debug + Send {
     fn r#type(&self) -> String;
@@ -60,10 +65,24 @@ impl Event for TaskOOM {
     }
 
     fn type_url(&self) -> String {
-        "containerd.events.TaskOOM".to_string()
+        TASK_OOM_EVENT_URL.to_string()
     }
 
     fn value(&self) -> Result<Vec<u8>> {
         self.write_to_bytes().context("get oom value")
+    }
+}
+
+impl Event for TaskExit {
+    fn r#type(&self) -> String {
+        TASK_EXIT_EVENT_TOPIC.to_string()
+    }
+
+    fn type_url(&self) -> String {
+        TASK_EXIT_EVENT_URL.to_string()
+    }
+
+    fn value(&self) -> Result<Vec<u8>> {
+        self.write_to_bytes().context("get exit value")
     }
 }

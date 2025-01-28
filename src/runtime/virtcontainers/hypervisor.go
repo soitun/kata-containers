@@ -9,6 +9,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"runtime"
 	"strings"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/config"
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/govmm"
+	govmmQemu "github.com/kata-containers/kata-containers/src/runtime/pkg/govmm/qemu"
 	hv "github.com/kata-containers/kata-containers/src/runtime/pkg/hypervisors"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
 
@@ -40,11 +42,11 @@ const (
 	// QemuHypervisor is the QEMU hypervisor.
 	QemuHypervisor HypervisorType = "qemu"
 
-	// AcrnHypervisor is the ACRN hypervisor.
-	AcrnHypervisor HypervisorType = "acrn"
-
 	// ClhHypervisor is the ICH hypervisor.
 	ClhHypervisor HypervisorType = "clh"
+
+	// StratovirtHypervisor is the StratoVirt hypervisor.
+	StratovirtHypervisor HypervisorType = "stratovirt"
 
 	// DragonballHypervisor is the Dragonball hypervisor.
 	DragonballHypervisor HypervisorType = "dragonball"
@@ -52,12 +54,15 @@ const (
 	// VirtFrameworkHypervisor is the Darwin Virtualization.framework hypervisor
 	VirtframeworkHypervisor HypervisorType = "virtframework"
 
+	// RemoteHypervisor is the Remote hypervisor.
+	RemoteHypervisor HypervisorType = "remote"
+
 	// MockHypervisor is a mock hypervisor for testing purposes
 	MockHypervisor HypervisorType = "mock"
 
 	procCPUInfo = "/proc/cpuinfo"
 
-	defaultVCPUs = 1
+	defaultVCPUs = float32(1)
 	// 2 GiB
 	defaultMemSzMiB = 2048
 
@@ -84,6 +89,7 @@ const (
 var (
 	hvLogger                   = logrus.WithField("source", "virtcontainers/hypervisor")
 	noGuestMemHotplugErr error = errors.New("guest memory hotplug not supported")
+	conflictingAssets    error = errors.New("cannot set both image and initrd at the same time")
 )
 
 // In some architectures the maximum number of vCPUs depends on the number of physical cores.
@@ -222,9 +228,6 @@ func (hType *HypervisorType) Set(value string) error {
 	case "firecracker":
 		*hType = FirecrackerHypervisor
 		return nil
-	case "acrn":
-		*hType = AcrnHypervisor
-		return nil
 	case "clh":
 		*hType = ClhHypervisor
 		return nil
@@ -233,6 +236,9 @@ func (hType *HypervisorType) Set(value string) error {
 		return nil
 	case "virtframework":
 		*hType = VirtframeworkHypervisor
+		return nil
+	case "remote":
+		*hType = RemoteHypervisor
 		return nil
 	case "mock":
 		*hType = MockHypervisor
@@ -249,10 +255,12 @@ func (hType *HypervisorType) String() string {
 		return string(QemuHypervisor)
 	case FirecrackerHypervisor:
 		return string(FirecrackerHypervisor)
-	case AcrnHypervisor:
-		return string(AcrnHypervisor)
 	case ClhHypervisor:
 		return string(ClhHypervisor)
+	case StratovirtHypervisor:
+		return string(StratovirtHypervisor)
+	case RemoteHypervisor:
+		return string(RemoteHypervisor)
 	case MockHypervisor:
 		return string(MockHypervisor)
 	default:
@@ -341,9 +349,6 @@ type HypervisorConfig struct {
 	// HypervisorPath is the hypervisor executable host path.
 	HypervisorPath string
 
-	// HypervisorCtlPath is the hypervisor ctl executable host path.
-	HypervisorCtlPath string
-
 	// JailerPath is the jailer executable host path.
 	JailerPath string
 
@@ -414,9 +419,6 @@ type HypervisorConfig struct {
 	// HypervisorPathList is the list of hypervisor paths names allowed in annotations
 	HypervisorPathList []string
 
-	// HypervisorCtlPathList is the list of hypervisor control paths names allowed in annotations
-	HypervisorCtlPathList []string
-
 	// JailerPathList is the list of jailer paths names allowed in annotations
 	JailerPathList []string
 
@@ -447,8 +449,21 @@ type HypervisorConfig struct {
 	// BlockiDeviceAIO specifies the I/O API to be used.
 	BlockDeviceAIO string
 
+	// The socket to connect to the remote hypervisor implementation on
+	RemoteHypervisorSocket string
+
+	// The name of the sandbox (pod)
+	SandboxName string
+
+	// The name of the namespace of the sandbox (pod)
+	SandboxNamespace string
+
 	// The user maps to the uid.
 	User string
+
+	// The path to the file containing the AMD SEV-SNP certificate chain
+	// (including VCEK/VLEK certificates).
+	SnpCertsPath string
 
 	// KernelParams are additional guest kernel parameters.
 	KernelParams []Param
@@ -505,12 +520,30 @@ type HypervisorConfig struct {
 	// MemOffset specifies memory space for nvdimm device
 	MemOffset uint64
 
-	// PCIeRootPort is used to indicate the number of PCIe Root Port devices
-	// The PCIe Root Port device is used to hot-plug the PCIe device
+	// VFIODevices are used to get PCIe device info early before the sandbox
+	// is started to make better PCIe topology decisions
+	VFIODevices []config.DeviceInfo
+	// VhostUserBlkDevices are handled differently in Q35 and Virt machine
+	// type. capture them early before the sandbox to make better PCIe topology
+	// decisions
+	VhostUserBlkDevices []config.DeviceInfo
+
+	// HotplugVFIO is used to indicate if devices need to be hotplugged on the
+	// root port or a switch
+	HotPlugVFIO config.PCIePort
+
+	// ColdPlugVFIO is used to indicate if devices need to be coldplugged on the
+	// root port, switch or no port
+	ColdPlugVFIO config.PCIePort
+
+	// PCIeRootPort is the number of root-port to create for the VM
 	PCIeRootPort uint32
 
+	// PCIeSwitchPort is the number of switch-port to create for the VM
+	PCIeSwitchPort uint32
+
 	// NumVCPUs specifies default number of vCPUs for the VM.
-	NumVCPUs uint32
+	NumVCPUsF float32
 
 	//DefaultMaxVCPUs specifies the maximum number of vCPUs for the VM.
 	DefaultMaxVCPUs uint32
@@ -543,6 +576,9 @@ type HypervisorConfig struct {
 	// Group ID.
 	Gid uint32
 
+	// Timeout for actions e.g. startVM for the remote hypervisor
+	RemoteHypervisorTimeout uint32
+
 	// BlockDeviceCacheSet specifies cache-related options will be set to block devices or not.
 	BlockDeviceCacheSet bool
 
@@ -562,7 +598,7 @@ type HypervisorConfig struct {
 	EnableIOThreads bool
 
 	// Debug changes the default hypervisor and kernel parameters to
-	// enable debug output where available. And Debug also enable the hmp socket.
+	// enable debug output where available.
 	Debug bool
 
 	// MemPrealloc specifies if the memory should be pre-allocated
@@ -586,10 +622,6 @@ type HypervisorConfig struct {
 
 	// DisableImageNvdimm is used to disable guest rootfs image nvdimm devices
 	DisableImageNvdimm bool
-
-	// HotplugVFIOOnRootBus is used to indicate if devices need to be hotplugged on the
-	// root bus instead of a bridge.
-	HotplugVFIOOnRootBus bool
 
 	// GuestMemoryDumpPaging is used to indicate if enable paging
 	// for QEMU dump-guest-memory command
@@ -632,6 +664,21 @@ type HypervisorConfig struct {
 
 	// Use legacy serial for the guest console
 	LegacySerial bool
+
+	// ExtraMonitorSocket allows to add an extra HMP or QMP socket when the VMM is Qemu
+	ExtraMonitorSocket govmmQemu.MonitorProtocol
+
+	// QgsPort defines Intel Quote Generation Service port exposed from the host
+	QgsPort uint32
+
+	// Initdata defines the initdata passed into guest when CreateVM
+	Initdata string
+
+	// GPU specific annotations (currently only applicable for Remote Hypervisor)
+	//DefaultGPUs specifies the number of GPUs required for the Kata VM
+	DefaultGPUs uint32
+	// DefaultGPUModel specifies GPU model like tesla, h100, readeon etc.
+	DefaultGPUModel string
 }
 
 // vcpu mapping from vcpu number to thread number
@@ -690,6 +737,52 @@ func (conf *HypervisorConfig) AddCustomAsset(a *types.Asset) error {
 	return nil
 }
 
+// ImageOrInitrdAssetPath returns an image or an initrd path, along with the corresponding asset type
+// Annotation path is preferred to config path.
+func (conf *HypervisorConfig) ImageOrInitrdAssetPath() (string, types.AssetType, error) {
+	var image, initrd string
+
+	checkAndReturn := func(image string, initrd string) (string, types.AssetType, error) {
+		if image != "" && initrd != "" {
+			return "", types.UnkownAsset, conflictingAssets
+		}
+
+		if image != "" {
+			return image, types.ImageAsset, nil
+		}
+
+		if initrd != "" {
+			return initrd, types.InitrdAsset, nil
+		}
+
+		// Even if neither image nor initrd are set, we still need to return
+		// if we are running a confidential guest on QemuCCWVirtio. (IBM Z Secure Execution)
+		if conf.ConfidentialGuest && conf.HypervisorMachineType == QemuCCWVirtio {
+			return "", types.SecureBootAsset, nil
+		}
+
+		return "", types.UnkownAsset, fmt.Errorf("one of image and initrd must be set")
+	}
+
+	if a, ok := conf.customAssets[types.ImageAsset]; ok {
+		image = a.Path()
+	}
+
+	if a, ok := conf.customAssets[types.InitrdAsset]; ok {
+		initrd = a.Path()
+	}
+
+	path, assetType, err := checkAndReturn(image, initrd)
+	if assetType != types.UnkownAsset {
+		return path, assetType, nil
+	}
+	if err == conflictingAssets {
+		return "", types.UnkownAsset, errors.Wrapf(err, "conflicting annotations")
+	}
+
+	return checkAndReturn(conf.ImagePath, conf.InitrdPath)
+}
+
 func (conf *HypervisorConfig) assetPath(t types.AssetType) (string, error) {
 	// Custom assets take precedence over the configured ones
 	a, ok := conf.customAssets[t]
@@ -708,8 +801,6 @@ func (conf *HypervisorConfig) assetPath(t types.AssetType) (string, error) {
 		return conf.InitrdPath, nil
 	case types.HypervisorAsset:
 		return conf.HypervisorPath, nil
-	case types.HypervisorCtlAsset:
-		return conf.HypervisorCtlPath, nil
 	case types.JailerAsset:
 		return conf.JailerPath, nil
 	case types.FirmwareAsset:
@@ -765,11 +856,6 @@ func (conf *HypervisorConfig) IfPVPanicEnabled() bool {
 	return conf.GuestMemoryDumpPath != ""
 }
 
-// HypervisorCtlAssetPath returns the VM hypervisor ctl path
-func (conf *HypervisorConfig) HypervisorCtlAssetPath() (string, error) {
-	return conf.assetPath(types.HypervisorCtlAsset)
-}
-
 // CustomHypervisorAsset returns true if the hypervisor asset is a custom one, false otherwise.
 func (conf *HypervisorConfig) CustomHypervisorAsset() bool {
 	return conf.isCustomAsset(types.HypervisorAsset)
@@ -783,6 +869,14 @@ func (conf *HypervisorConfig) FirmwareAssetPath() (string, error) {
 // FirmwareVolumeAssetPath returns the guest firmware volume path
 func (conf *HypervisorConfig) FirmwareVolumeAssetPath() (string, error) {
 	return conf.assetPath(types.FirmwareVolumeAsset)
+}
+
+func RoundUpNumVCPUs(cpus float32) uint32 {
+	return uint32(math.Ceil(float64(cpus)))
+}
+
+func (conf HypervisorConfig) NumVCPUs() uint32 {
+	return RoundUpNumVCPUs(conf.NumVCPUsF)
 }
 
 func appendParam(params []Param, parameter string, value string) []Param {
@@ -866,7 +960,7 @@ func CheckCmdline(kernelCmdlinePath, searchParam string, searchValues []string) 
 
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
-		for _, field := range strings.Fields(scanner.Text()) {
+		for _, field := range KernelParamFields(scanner.Text()) {
 			if check(field, searchParam, searchValues) {
 				return true, nil
 			}
@@ -888,7 +982,7 @@ func CPUFlags(cpuInfoPath string) (map[string]bool, error) {
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
 		// Expected format: ["flags", ":", ...] or ["flags:", ...]
-		fields := strings.Fields(scanner.Text())
+		fields := KernelParamFields(scanner.Text())
 		if len(fields) < 2 {
 			continue
 		}
@@ -1031,4 +1125,36 @@ type Hypervisor interface {
 
 	// check if hypervisor supports built-in rate limiter.
 	IsRateLimiterBuiltin() bool
+}
+
+// KernelParamFields is similar to strings.Fields(), but doesn't split
+// based on space characters that are part of a quoted substring. Example
+// of quoted kernel command line parameter value:
+// dm-mod.create="dm-verity,,,ro,0 736328 verity 1
+// /dev/vda1 /dev/vda2 4096 4096 92041 0 sha256
+// f211b9f1921ef726d57a72bf82be23a510076639fa8549ade10f85e214e0ddb4
+// 065c13dfb5b4e0af034685aa5442bddda47b17c182ee44ba55a373835d18a038"
+func KernelParamFields(s string) []string {
+	var params []string
+
+	start := 0
+	inQuote := false
+	for current, c := range s {
+		if c == '"' {
+			inQuote = !inQuote
+		} else if c == ' ' && !inQuote {
+			newParam := strings.TrimSpace(s[start:current])
+			if newParam != "" {
+				params = append(params, newParam)
+			}
+			start = current + 1
+		}
+	}
+
+	newParam := strings.TrimSpace(s[start:])
+	if newParam != "" {
+		params = append(params, newParam)
+	}
+
+	return params
 }

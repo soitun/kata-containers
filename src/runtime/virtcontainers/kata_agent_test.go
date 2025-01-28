@@ -479,15 +479,20 @@ func TestAppendDevicesEmptyContainerDeviceList(t *testing.T) {
 func TestAppendDevices(t *testing.T) {
 	k := kataAgent{}
 
-	id := "test-append-block"
+	testBlockDeviceID := "test-block-device"
+	testCharacterDeviceId := "test-character-device"
+
 	ctrDevices := []api.Device{
 		&drivers.BlockDevice{
 			GenericDevice: &drivers.GenericDevice{
-				ID: id,
+				ID: testBlockDeviceID,
 			},
 			BlockDrive: &config.BlockDrive{
 				PCIPath: testPCIPath,
 			},
+		},
+		&drivers.GenericDevice{
+			ID: testCharacterDeviceId,
 		},
 	}
 
@@ -503,10 +508,16 @@ func TestAppendDevices(t *testing.T) {
 			config:     sandboxConfig,
 		},
 	}
-	c.devices = append(c.devices, ContainerDevice{
-		ID:            id,
-		ContainerPath: testBlockDeviceCtrPath,
-	})
+	c.devices = append(
+		c.devices,
+		ContainerDevice{
+			ID:            testBlockDeviceID,
+			ContainerPath: testBlockDeviceCtrPath,
+		},
+		ContainerDevice{
+			ID: testCharacterDeviceId,
+		},
+	)
 
 	devList := []*pb.Device{}
 	expected := []*pb.Device{
@@ -576,12 +587,12 @@ func TestConstrainGRPCSpec(t *testing.T) {
 
 	g := &pb.Spec{
 		Hooks: &pb.Hooks{},
-		Mounts: []pb.Mount{
+		Mounts: []*pb.Mount{
 			{Destination: "/dev/shm"},
 		},
 		Linux: &pb.Linux{
 			Seccomp: &pb.LinuxSeccomp{},
-			Namespaces: []pb.LinuxNamespace{
+			Namespaces: []*pb.LinuxNamespace{
 				{
 					Type: string(specs.NetworkNamespace),
 					Path: "/abc/123",
@@ -592,16 +603,16 @@ func TestConstrainGRPCSpec(t *testing.T) {
 				},
 			},
 			Resources: &pb.LinuxResources{
-				Devices:        []pb.LinuxDeviceCgroup{},
+				Devices:        []*pb.LinuxDeviceCgroup{},
 				Memory:         &pb.LinuxMemory{},
 				CPU:            &pb.LinuxCPU{},
 				Pids:           &pb.LinuxPids{},
 				BlockIO:        &pb.LinuxBlockIO{},
-				HugepageLimits: []pb.LinuxHugepageLimit{},
+				HugepageLimits: []*pb.LinuxHugepageLimit{},
 				Network:        &pb.LinuxNetwork{},
 			},
 			CgroupsPath: "system.slice:foo:bar",
-			Devices: []pb.LinuxDevice{
+			Devices: []*pb.LinuxDevice{
 				{
 					Path: "/dev/vfio/1",
 					Type: "c",
@@ -716,7 +727,7 @@ func TestHandlePidNamespace(t *testing.T) {
 
 	g := &pb.Spec{
 		Linux: &pb.Linux{
-			Namespaces: []pb.LinuxNamespace{
+			Namespaces: []*pb.LinuxNamespace{
 				{
 					Type: string(specs.NetworkNamespace),
 					Path: "/abc/123",
@@ -747,8 +758,8 @@ func TestHandlePidNamespace(t *testing.T) {
 		Path: "",
 	}
 
-	g.Linux.Namespaces = append(g.Linux.Namespaces, pidNs)
-	g.Linux.Namespaces = append(g.Linux.Namespaces, utsNs)
+	g.Linux.Namespaces = append(g.Linux.Namespaces, &pidNs)
+	g.Linux.Namespaces = append(g.Linux.Namespaces, &utsNs)
 
 	sharedPid = k.handlePidNamespace(g, sandbox)
 	assert.False(sharedPid)
@@ -758,7 +769,7 @@ func TestHandlePidNamespace(t *testing.T) {
 		Type: string(specs.PIDNamespace),
 		Path: "/proc/112/ns/pid",
 	}
-	g.Linux.Namespaces = append(g.Linux.Namespaces, pidNs)
+	g.Linux.Namespaces = append(g.Linux.Namespaces, &pidNs)
 
 	sharedPid = k.handlePidNamespace(g, sandbox)
 	assert.True(sharedPid)
@@ -846,6 +857,7 @@ func TestAgentCreateContainer(t *testing.T) {
 			},
 		},
 		hypervisor: &mockHypervisor{},
+		agent:      newMockAgent(),
 	}
 
 	fsShare, err := NewFilesystemShare(sandbox)
@@ -989,6 +1001,49 @@ func TestKataCopyFile(t *testing.T) {
 	}()
 
 	err = k.copyFile(context.Background(), src.Name(), dst.Name())
+	assert.NoError(err)
+}
+
+func TestKataCopyFileWithSymlink(t *testing.T) {
+	assert := assert.New(t)
+
+	url, err := mock.GenerateKataMockHybridVSock()
+	assert.NoError(err)
+	defer mock.RemoveKataMockHybridVSock(url)
+
+	hybridVSockTTRPCMock := mock.HybridVSockTTRPCMock{}
+	err = hybridVSockTTRPCMock.Start(url)
+	assert.NoError(err)
+	defer hybridVSockTTRPCMock.Stop()
+
+	k := &kataAgent{
+		ctx: context.Background(),
+		state: KataAgentState{
+			URL: url,
+		},
+	}
+
+	tempDir := t.TempDir()
+
+	target := filepath.Join(tempDir, "target")
+	err = os.WriteFile(target, []byte("abcdefghi123456789"), 0666)
+	assert.NoError(err)
+
+	symlink := filepath.Join(tempDir, "symlink")
+	os.Symlink(target, symlink)
+
+	dst, err := os.CreateTemp("", "dst")
+	assert.NoError(err)
+	assert.NoError(dst.Close())
+	defer os.Remove(dst.Name())
+
+	orgGrpcMaxDataSize := grpcMaxDataSize
+	grpcMaxDataSize = 1
+	defer func() {
+		grpcMaxDataSize = orgGrpcMaxDataSize
+	}()
+
+	err = k.copyFile(context.Background(), symlink, dst.Name())
 	assert.NoError(err)
 }
 
@@ -1146,4 +1201,20 @@ func TestKataAgentDirs(t *testing.T) {
 	cid := "123"
 	expected := "/rafs/123/lowerdir"
 	assert.Equal(rafsMountPath(cid), expected)
+}
+
+func TestIsNydusRootFSType(t *testing.T) {
+	testCases := map[string]bool{
+		"nydus":                               false,
+		"nydus-overlayfs":                     false,
+		"fuse.nydus-overlayfs":                true,
+		"fuse./usr/local/bin/nydus-overlayfs": true,
+		"fuse.nydus-overlayfs-e0ae398a2":      true,
+	}
+
+	for test, exp := range testCases {
+		t.Run(test, func(t *testing.T) {
+			assert.Equal(t, exp, IsNydusRootFSType(test))
+		})
+	}
 }

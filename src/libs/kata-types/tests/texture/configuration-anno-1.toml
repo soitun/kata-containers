@@ -45,7 +45,6 @@ enable_iommu = true
 enable_iommu_platform = true
 file_mem_backend = "/dev/shm"
 valid_file_mem_backends = ["/dev/shm"]
-enable_swap = true
 pflashes = ["/proc/mounts"]
 enable_debug = true
 msize_9p = 16384
@@ -72,7 +71,7 @@ container_pipe_size = 2
 [runtime]
 enable_debug = true
 internetworking_model="macvtap"
-pdisable_guest_seccomp=true
+disable_guest_seccomp=true
 enable_tracing = true
 jaeger_endpoint = "localhost:1234"
 jaeger_user = "user"
@@ -83,6 +82,7 @@ sandbox_bind_mounts=["/proc/self"]
 vfio_mode="vfio"
 experimental=["a", "b"]
 enable_pprof = true
+name="virt-container"
 hypervisor_name = "qemu"
 agent_name = "agent0"
 

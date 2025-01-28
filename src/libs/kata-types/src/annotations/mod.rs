@@ -12,10 +12,7 @@ use std::u32;
 
 use serde::Deserialize;
 
-use crate::config::default::DEFAULT_AGENT_TYPE_NAME;
-use crate::config::default::DEFAULT_HYPERVISOR;
-use crate::config::default::DEFAULT_RUNTIME_NAME;
-use crate::config::hypervisor::get_hypervisor_plugin;
+use crate::config::hypervisor::{get_hypervisor_plugin, HugePageType};
 
 use crate::config::TomlConfig;
 use crate::sl;
@@ -91,12 +88,6 @@ pub const KATA_ANNO_CFG_HYPERVISOR_PREFIX: &str = "io.katacontainers.config.hype
 pub const KATA_ANNO_CFG_HYPERVISOR_PATH: &str = "io.katacontainers.config.hypervisor.path";
 /// A sandbox annotation for passing a container hypervisor binary SHA-512 hash value.
 pub const KATA_ANNO_CFG_HYPERVISOR_HASH: &str = "io.katacontainers.config.hypervisor.path_hash";
-/// A sandbox annotation for passing a per container path pointing at the hypervisor control binary
-/// that will run the container VM.
-pub const KATA_ANNO_CFG_HYPERVISOR_CTLPATH: &str = "io.katacontainers.config.hypervisor.ctlpath";
-/// A sandbox annotation for passing a container hypervisor control binary SHA-512 hash value.
-pub const KATA_ANNO_CFG_HYPERVISOR_CTLHASH: &str =
-    "io.katacontainers.config.hypervisor.hypervisorctl_hash";
 /// A sandbox annotation for passing a per container path pointing at the jailer that will constrain
 /// the container VM.
 pub const KATA_ANNO_CFG_HYPERVISOR_JAILER_PATH: &str =
@@ -225,17 +216,17 @@ pub const KATA_ANNO_CFG_HYPERVISOR_MEMORY_SLOTS: &str =
 pub const KATA_ANNO_CFG_HYPERVISOR_MEMORY_PREALLOC: &str =
     "io.katacontainers.config.hypervisor.enable_mem_prealloc";
 /// A sandbox annotation to specify if the memory should be pre-allocated from huge pages.
-pub const KATA_ANNO_CFG_HYPERVISOR_HUGE_PAGES: &str =
+pub const KATA_ANNO_CFG_HYPERVISOR_ENABLE_HUGEPAGES: &str =
     "io.katacontainers.config.hypervisor.enable_hugepages";
+/// A sandbox annotation to specify huge page mode of memory backend.
+pub const KATA_ANNO_CFG_HYPERVISOR_HUGEPAGE_TYPE: &str =
+    "io.katacontainers.config.hypervisor.hugepage_type";
 /// A sandbox annotation to soecify file based memory backend root directory.
 pub const KATA_ANNO_CFG_HYPERVISOR_FILE_BACKED_MEM_ROOT_DIR: &str =
     "io.katacontainers.config.hypervisor.file_mem_backend";
 /// A sandbox annotation that is used to enable/disable virtio-mem.
 pub const KATA_ANNO_CFG_HYPERVISOR_VIRTIO_MEM: &str =
     "io.katacontainers.config.hypervisor.enable_virtio_mem";
-/// A sandbox annotation to enable swap of vm memory.
-pub const KATA_ANNO_CFG_HYPERVISOR_ENABLE_SWAP: &str =
-    "io.katacontainers.config.hypervisor.enable_swap";
 /// A sandbox annotation to enable swap in the guest.
 pub const KATA_ANNO_CFG_HYPERVISOR_ENABLE_GUEST_SWAP: &str =
     "io.katacontainers.config.hypervisor.enable_guest_swap";
@@ -307,6 +298,20 @@ pub const KATA_ANNO_CFG_DISABLE_NEW_NETNS: &str =
     "io.katacontainers.config.runtime.disable_new_netns";
 /// A sandbox annotation to specify how attached VFIO devices should be treated.
 pub const KATA_ANNO_CFG_VFIO_MODE: &str = "io.katacontainers.config.runtime.vfio_mode";
+/// An annotation to declare shared mount points, which is a set of mount points that directly share mounted objects between containers.
+pub const KATA_ANNO_CFG_SHARED_MOUNTS: &str = "io.katacontainers.config.runtime.shared_mounts";
+
+/// A sandbox annotation used to specify prefetch_files.list host path container image
+/// being used,
+/// and runtime will pass it to Hypervisor to  search for corresponding prefetch list file.
+/// "io.katacontainers.config.hypervisor.prefetch_files.list"
+///                                = "/path/to/<uid>/xyz.com/fedora:36/prefetch_file.list"
+pub const KATA_ANNO_CFG_HYPERVISOR_PREFETCH_FILES_LIST: &str =
+    "io.katacontainers.config.hypervisor.prefetch_files.list";
+
+/// A sandbox annotation for sandbox level volume sharing with host.
+pub const KATA_ANNO_CFG_SANDBOX_BIND_MOUNTS: &str =
+    "io.katacontainers.config.runtime.sandbox_bind_mounts";
 
 /// A helper structure to query configuration information by check annotations.
 #[derive(Debug, Default, Deserialize)]
@@ -409,10 +414,10 @@ impl Annotation {
         match self.get_value::<u32>(KATA_ANNO_CONTAINER_RES_SWAPPINESS) {
             Ok(r) => {
                 if r.unwrap_or_default() > 100 {
-                    return Err(io::Error::new(
+                    Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!("{} greater than 100", r.unwrap_or_default()),
-                    ));
+                    ))
                 } else {
                     Ok(r)
                 }
@@ -446,13 +451,22 @@ impl Annotation {
 
         // set default values for runtime.name, runtime.hypervisor_name and runtime.agent
         if config.runtime.name.is_empty() {
-            config.runtime.name = DEFAULT_RUNTIME_NAME.to_string()
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Runtime name is missing in the configuration",
+            ));
         }
         if config.runtime.hypervisor_name.is_empty() {
-            config.runtime.hypervisor_name = DEFAULT_HYPERVISOR.to_string()
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Hypervisor name is missing in the configuration",
+            ));
         }
         if config.runtime.agent_name.is_empty() {
-            config.runtime.agent_name = DEFAULT_AGENT_TYPE_NAME.to_string()
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Agent name is missing in the configuration",
+            ));
         }
 
         let hypervisor_name = &config.runtime.hypervisor_name;
@@ -462,8 +476,18 @@ impl Annotation {
         let u32_err = io::Error::new(io::ErrorKind::InvalidData, "parse u32 error".to_string());
         let u64_err = io::Error::new(io::ErrorKind::InvalidData, "parse u64 error".to_string());
         let i32_err = io::Error::new(io::ErrorKind::InvalidData, "parse i32 error".to_string());
-        let mut hv = config.hypervisor.get_mut(hypervisor_name).unwrap();
-        let mut ag = config.agent.get_mut(agent_name).unwrap();
+        let hv = config.hypervisor.get_mut(hypervisor_name).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Invalid hypervisor name {}", hypervisor_name),
+            )
+        })?;
+        let ag = config.agent.get_mut(agent_name).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Invalid agent name {}", agent_name),
+            )
+        })?;
         for (key, value) in &self.annotations {
             if hv.security_info.is_annotation_enabled(key) {
                 match key.as_str() {
@@ -472,10 +496,6 @@ impl Annotation {
                     KATA_ANNO_CFG_HYPERVISOR_PATH => {
                         hv.validate_hypervisor_path(value)?;
                         hv.path = value.to_string();
-                    }
-                    KATA_ANNO_CFG_HYPERVISOR_CTLPATH => {
-                        hv.validate_hypervisor_ctlpath(value)?;
-                        hv.ctlpath = value.to_string();
                     }
 
                     KATA_ANNO_CFG_HYPERVISOR_JAILER_PATH => {
@@ -673,12 +693,15 @@ impl Annotation {
                         hv.machine_info.validate_entropy_source(value)?;
                         hv.machine_info.entropy_source = value.to_string();
                     }
+                    KATA_ANNO_CFG_HYPERVISOR_PREFETCH_FILES_LIST => {
+                        hv.prefetch_list_path = value.to_string();
+                    }
                     // Hypervisor Memory related annotations
                     KATA_ANNO_CFG_HYPERVISOR_DEFAULT_MEMORY => {
-                        match byte_unit::Byte::from_str(value) {
+                        match byte_unit::Byte::parse_str(value, true) {
                             Ok(mem_bytes) => {
                                 let memory_size = mem_bytes
-                                    .get_adjusted_unit(byte_unit::ByteUnit::MiB)
+                                    .get_adjusted_unit(byte_unit::Unit::MiB)
                                     .get_value()
                                     as u32;
                                 info!(sl!(), "get mem {} from annotations: {}", memory_size, value);
@@ -725,14 +748,29 @@ impl Annotation {
                             return Err(bool_err);
                         }
                     },
-                    KATA_ANNO_CFG_HYPERVISOR_HUGE_PAGES => match self.get_value::<bool>(key) {
-                        Ok(r) => {
-                            hv.memory_info.enable_hugepages = r.unwrap_or_default();
+                    KATA_ANNO_CFG_HYPERVISOR_ENABLE_HUGEPAGES => {
+                        match self.get_value::<bool>(key) {
+                            Ok(r) => {
+                                hv.memory_info.enable_hugepages = r.unwrap_or_default();
+                            }
+                            Err(_e) => {
+                                return Err(bool_err);
+                            }
                         }
-                        Err(_e) => {
-                            return Err(bool_err);
+                    }
+                    KATA_ANNO_CFG_HYPERVISOR_HUGEPAGE_TYPE => {
+                        match self.get_value::<HugePageType>(key) {
+                            Ok(r) => {
+                                hv.memory_info.hugepage_type = r.unwrap_or_default();
+                            }
+                            Err(e) => {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    format!("parse huge pages type: {}, error: {}", value, e),
+                                ));
+                            }
                         }
-                    },
+                    }
                     KATA_ANNO_CFG_HYPERVISOR_FILE_BACKED_MEM_ROOT_DIR => {
                         hv.memory_info.validate_memory_backend_path(value)?;
                         hv.memory_info.file_mem_backend = value.to_string();
@@ -740,14 +778,6 @@ impl Annotation {
                     KATA_ANNO_CFG_HYPERVISOR_VIRTIO_MEM => match self.get_value::<bool>(key) {
                         Ok(r) => {
                             hv.memory_info.enable_virtio_mem = r.unwrap_or_default();
-                        }
-                        Err(_e) => {
-                            return Err(bool_err);
-                        }
-                    },
-                    KATA_ANNO_CFG_HYPERVISOR_ENABLE_SWAP => match self.get_value::<bool>(key) {
-                        Ok(r) => {
-                            hv.memory_info.enable_swap = r.unwrap_or_default();
                         }
                         Err(_e) => {
                             return Err(bool_err);
@@ -938,6 +968,19 @@ impl Annotation {
                     },
                     KATA_ANNO_CFG_VFIO_MODE => {
                         config.runtime.vfio_mode = value.to_string();
+                    }
+                    KATA_ANNO_CFG_SHARED_MOUNTS => {
+                        config.runtime.shared_mounts = serde_json::from_str(value.as_str())?;
+                    }
+                    KATA_ANNO_CFG_SANDBOX_BIND_MOUNTS => {
+                        let args: Vec<String> = value
+                            .to_string()
+                            .split_ascii_whitespace()
+                            .map(str::to_string)
+                            .collect();
+                        for arg in args {
+                            config.runtime.sandbox_bind_mounts.push(arg.to_string());
+                        }
                     }
                     _ => {
                         warn!(sl!(), "Annotation {} not enabled", key);

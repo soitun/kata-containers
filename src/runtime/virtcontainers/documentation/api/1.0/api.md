@@ -102,9 +102,6 @@ const (
 	// QemuHypervisor is the QEMU hypervisor.
 	QemuHypervisor HypervisorType = "qemu"
 
-	// AcrnHypervisor is the ACRN hypervisor.
-	AcrnHypervisor HypervisorType = "acrn"
-
 	// ClhHypervisor is the ICH hypervisor.
 	ClhHypervisor HypervisorType = "clh"
 
@@ -172,12 +169,6 @@ type HypervisorConfig struct {
 
 	// HypervisorPathList is the list of hypervisor paths names allowed in annotations
 	HypervisorPathList []string
-
-	// HypervisorCtlPathList is the list of hypervisor control paths names allowed in annotations
-	HypervisorCtlPathList []string
-
-	// HypervisorCtlPath is the hypervisor ctl executable host path.
-	HypervisorCtlPath string
 
 	// JailerPath is the jailer executable host path.
 	JailerPath string
@@ -284,13 +275,13 @@ type HypervisorConfig struct {
 	// DisableImageNvdimm is used to disable guest rootfs image nvdimm devices
 	DisableImageNvdimm bool
 
-	// HotplugVFIOOnRootBus is used to indicate if devices need to be hotplugged on the
-	// root bus instead of a bridge.
-	HotplugVFIOOnRootBus bool
+	// HotPlugVFIO is used to indicate if devices need to be hotplugged on the
+	// root port, switch, bridge or no port
+	HotPlugVFIO hv.PCIePort
 
-	// PCIeRootPort is used to indicate the number of PCIe Root Port devices
-	// The PCIe Root Port device is used to hot-plug the PCIe device
-	PCIeRootPort uint32
+	// ColdPlugVFIO is used to indicate if devices need to be coldplugged on the
+	// root port, switch, bridge or no port
+	ColdPlugVFIO hv.PCIePort
 
 	// BootToBeTemplate used to indicate if the VM is created to be a template VM
 	BootToBeTemplate bool

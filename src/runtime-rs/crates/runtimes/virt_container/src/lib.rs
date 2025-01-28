@@ -19,39 +19,66 @@ use std::sync::Arc;
 use agent::{kata::KataAgent, AGENT_KATA};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use common::{message::Message, RuntimeHandler, RuntimeInstance};
-use hypervisor::{dragonball::Dragonball, Hypervisor, HYPERVISOR_DRAGONBALL};
+use common::{message::Message, types::SandboxConfig, RuntimeHandler, RuntimeInstance};
+use hypervisor::Hypervisor;
+#[cfg(all(feature = "dragonball", not(target_arch = "s390x")))]
+use hypervisor::{dragonball::Dragonball, HYPERVISOR_DRAGONBALL};
+#[cfg(not(target_arch = "s390x"))]
+use hypervisor::{firecracker::Firecracker, HYPERVISOR_FIRECRACKER};
 use hypervisor::{qemu::Qemu, HYPERVISOR_QEMU};
-use kata_types::config::{
-    hypervisor::register_hypervisor_plugin, DragonballConfig, QemuConfig, TomlConfig,
-};
+use hypervisor::{remote::Remote, HYPERVISOR_REMOTE};
+#[cfg(all(feature = "dragonball", not(target_arch = "s390x")))]
+use kata_types::config::DragonballConfig;
+#[cfg(not(target_arch = "s390x"))]
+use kata_types::config::FirecrackerConfig;
+use kata_types::config::RemoteConfig;
+use kata_types::config::{hypervisor::register_hypervisor_plugin, QemuConfig, TomlConfig};
 
-#[cfg(feature = "cloud-hypervisor")]
+#[cfg(all(feature = "cloud-hypervisor", not(target_arch = "s390x")))]
 use hypervisor::ch::CloudHypervisor;
-#[cfg(feature = "cloud-hypervisor")]
+#[cfg(all(feature = "cloud-hypervisor", not(target_arch = "s390x")))]
 use kata_types::config::{hypervisor::HYPERVISOR_NAME_CH, CloudHypervisorConfig};
 
+use resource::cpu_mem::initial_size::InitialSizeManager;
 use resource::ResourceManager;
 use sandbox::VIRTCONTAINER;
 use tokio::sync::mpsc::Sender;
+use tracing::instrument;
 
+unsafe impl Send for VirtContainer {}
+unsafe impl Sync for VirtContainer {}
+#[derive(Debug)]
 pub struct VirtContainer {}
 
 #[async_trait]
 impl RuntimeHandler for VirtContainer {
     fn init() -> Result<()> {
+        // Before start logging with virt-container, regist it
+        logging::register_subsystem_logger("runtimes", "virt-container");
+
         // register
-        let dragonball_config = Arc::new(DragonballConfig::new());
-        register_hypervisor_plugin("dragonball", dragonball_config);
+        #[cfg(not(target_arch = "s390x"))]
+        {
+            #[cfg(feature = "dragonball")]
+            let dragonball_config = Arc::new(DragonballConfig::new());
+            #[cfg(feature = "dragonball")]
+            register_hypervisor_plugin("dragonball", dragonball_config);
+
+            let firecracker_config = Arc::new(FirecrackerConfig::new());
+            register_hypervisor_plugin("firecracker", firecracker_config);
+        }
 
         let qemu_config = Arc::new(QemuConfig::new());
         register_hypervisor_plugin("qemu", qemu_config);
 
-        #[cfg(feature = "cloud-hypervisor")]
+        #[cfg(all(feature = "cloud-hypervisor", not(target_arch = "s390x")))]
         {
             let ch_config = Arc::new(CloudHypervisorConfig::new());
             register_hypervisor_plugin(HYPERVISOR_NAME_CH, ch_config);
         }
+
+        let remote_config = Arc::new(RemoteConfig::new());
+        register_hypervisor_plugin("remote", remote_config);
 
         Ok(())
     }
@@ -64,22 +91,29 @@ impl RuntimeHandler for VirtContainer {
         Arc::new(VirtContainer {})
     }
 
+    #[instrument]
     async fn new_instance(
         &self,
         sid: &str,
         msg_sender: Sender<Message>,
         config: Arc<TomlConfig>,
+        init_size_manager: InitialSizeManager,
+        sandbox_config: SandboxConfig,
     ) -> Result<RuntimeInstance> {
         let hypervisor = new_hypervisor(&config).await.context("new hypervisor")?;
 
         // get uds from hypervisor and get config from toml_config
         let agent = new_agent(&config).context("new agent")?;
-        let resource_manager = Arc::new(ResourceManager::new(
-            sid,
-            agent.clone(),
-            hypervisor.clone(),
-            config,
-        )?);
+        let resource_manager = Arc::new(
+            ResourceManager::new(
+                sid,
+                agent.clone(),
+                hypervisor.clone(),
+                config,
+                init_size_manager,
+            )
+            .await?,
+        );
         let pid = std::process::id();
 
         let sandbox = sandbox::VirtSandbox::new(
@@ -88,6 +122,7 @@ impl RuntimeHandler for VirtContainer {
             agent.clone(),
             hypervisor.clone(),
             resource_manager.clone(),
+            sandbox_config,
         )
         .await
         .context("new virt sandbox")?;
@@ -121,29 +156,47 @@ async fn new_hypervisor(toml_config: &TomlConfig) -> Result<Arc<dyn Hypervisor>>
     // TODO: support other hypervisor
     // issue: https://github.com/kata-containers/kata-containers/issues/4634
     match hypervisor_name.as_str() {
+        #[cfg(all(feature = "dragonball", not(target_arch = "s390x")))]
         HYPERVISOR_DRAGONBALL => {
-            let mut hypervisor = Dragonball::new();
+            let hypervisor = Dragonball::new();
             hypervisor
                 .set_hypervisor_config(hypervisor_config.clone())
                 .await;
+            if toml_config.runtime.use_passfd_io {
+                hypervisor
+                    .set_passfd_listener_port(toml_config.runtime.passfd_listener_port)
+                    .await;
+            }
             Ok(Arc::new(hypervisor))
         }
         HYPERVISOR_QEMU => {
-            let mut hypervisor = Qemu::new();
+            let hypervisor = Qemu::new();
             hypervisor
                 .set_hypervisor_config(hypervisor_config.clone())
                 .await;
             Ok(Arc::new(hypervisor))
         }
-
-        #[cfg(feature = "cloud-hypervisor")]
-        HYPERVISOR_NAME_CH => {
-            let mut hypervisor = CloudHypervisor::new();
-
+        #[cfg(not(target_arch = "s390x"))]
+        HYPERVISOR_FIRECRACKER => {
+            let hypervisor = Firecracker::new();
             hypervisor
                 .set_hypervisor_config(hypervisor_config.clone())
                 .await;
-
+            Ok(Arc::new(hypervisor))
+        }
+        #[cfg(all(feature = "cloud-hypervisor", not(target_arch = "s390x")))]
+        HYPERVISOR_NAME_CH => {
+            let hypervisor = CloudHypervisor::new();
+            hypervisor
+                .set_hypervisor_config(hypervisor_config.clone())
+                .await;
+            Ok(Arc::new(hypervisor))
+        }
+        HYPERVISOR_REMOTE => {
+            let hypervisor = Remote::new();
+            hypervisor
+                .set_hypervisor_config(hypervisor_config.clone())
+                .await;
             Ok(Arc::new(hypervisor))
         }
         _ => Err(anyhow!("Unsupported hypervisor {}", &hypervisor_name)),

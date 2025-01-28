@@ -3,17 +3,21 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-use protobuf::{CachedSize, SingularPtrField, UnknownFields};
+use protobuf::MessageField;
 
 use crate::cgroups::Manager as CgroupManager;
 use crate::protocols::agent::{BlkioStats, CgroupStats, CpuStats, MemoryStats, PidsStats};
 use anyhow::Result;
 use cgroups::freezer::FreezerState;
 use libc::{self, pid_t};
-use oci::LinuxResources;
+use oci::{LinuxResources, Spec};
+use oci_spec::runtime as oci;
 use std::any::Any;
 use std::collections::HashMap;
 use std::string::String;
+use std::sync::{Arc, RwLock};
+
+use super::DevicesCgroupInfo;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Manager {
@@ -33,13 +37,12 @@ impl CgroupManager for Manager {
 
     fn get_stats(&self) -> Result<CgroupStats> {
         Ok(CgroupStats {
-            cpu_stats: SingularPtrField::some(CpuStats::default()),
-            memory_stats: SingularPtrField::some(MemoryStats::new()),
-            pids_stats: SingularPtrField::some(PidsStats::new()),
-            blkio_stats: SingularPtrField::some(BlkioStats::new()),
+            cpu_stats: MessageField::some(CpuStats::default()),
+            memory_stats: MessageField::some(MemoryStats::new()),
+            pids_stats: MessageField::some(PidsStats::new()),
+            blkio_stats: MessageField::some(BlkioStats::new()),
             hugetlb_stats: HashMap::new(),
-            unknown_fields: UnknownFields::default(),
-            cached_size: CachedSize::default(),
+            ..Default::default()
         })
     }
 
@@ -73,7 +76,11 @@ impl CgroupManager for Manager {
 }
 
 impl Manager {
-    pub fn new(cpath: &str) -> Result<Self> {
+    pub fn new(
+        cpath: &str,
+        _spec: &Spec,
+        _devcg_info: Option<Arc<RwLock<DevicesCgroupInfo>>>,
+    ) -> Result<Self> {
         Ok(Self {
             paths: HashMap::new(),
             mounts: HashMap::new(),

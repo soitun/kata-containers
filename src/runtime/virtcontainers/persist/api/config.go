@@ -7,6 +7,7 @@
 package persistapi
 
 import (
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/config"
 	"github.com/opencontainers/runc/libcontainer/configs"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
@@ -35,10 +36,6 @@ type HypervisorConfig struct {
 	// HypervisorPath is the hypervisor executable host path.
 	HypervisorPath string
 
-	// HypervisorCtlPath is the hypervisor ctl executable host path.
-	HypervisorCtlPath string
-
-	// HypervisorCtlPath is the hypervisor ctl executable host path.
 	// JailerPath is the jailer executable host path.
 	JailerPath string
 
@@ -93,9 +90,6 @@ type HypervisorConfig struct {
 	// HypervisorPathList is the list of hypervisor paths names allowed in annotations
 	HypervisorPathList []string
 
-	// HypervisorCtlPathList is the list of hypervisor control paths names allowed in annotations
-	HypervisorCtlPathList []string
-
 	// JailerPathList is the list of jailer paths names allowed in annotations
 	JailerPathList []string
 
@@ -130,12 +124,8 @@ type HypervisorConfig struct {
 	// Enable SGX. Hardware-based isolation and memory encryption.
 	SGXEPCSize int64
 
-	// PCIeRootPort is used to indicate the number of PCIe Root Port devices
-	// The PCIe Root Port device is used to hot-plug the PCIe device
-	PCIeRootPort uint32
-
 	// NumVCPUs specifies default number of vCPUs for the VM.
-	NumVCPUs uint32
+	NumVCPUsF float32
 
 	//DefaultMaxVCPUs specifies the maximum number of vCPUs for the VM.
 	DefaultMaxVCPUs uint32
@@ -194,9 +184,19 @@ type HypervisorConfig struct {
 	// DisableImageNvdimm disables nvdimm for guest rootfs image
 	DisableImageNvdimm bool
 
-	// HotplugVFIOOnRootBus is used to indicate if devices need to be hotplugged on the
-	// root bus instead of a bridge.
-	HotplugVFIOOnRootBus bool
+	// HotPlugVFIO is used to indicate if devices need to be hotplugged on the
+	// root, switch, bridge or no-port
+	HotPlugVFIO config.PCIePort
+
+	// ColdPlugVFIO is used to indicate if devices need to be coldplugged on the
+	// root, bridge, switch or no-port
+	ColdPlugVFIO config.PCIePort
+
+	// PCIeRootPort is the number of ports needed in the hypvervisor
+	PCIeRootPort uint32
+
+	// PCIeSwitchPort is the number of ports needed in the hypvervisor
+	PCIeSwitchPort uint32
 
 	// BootToBeTemplate used to indicate if the VM is created to be a template VM
 	BootToBeTemplate bool

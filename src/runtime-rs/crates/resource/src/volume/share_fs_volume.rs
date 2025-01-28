@@ -5,17 +5,27 @@
 //
 
 use std::{
+    fs::File,
+    io::Read,
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
 };
 
+use agent::Agent;
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
+use hypervisor::device::device_manager::DeviceManager;
+use kata_sys_util::mount::{get_mount_options, get_mount_path, get_mount_type};
+use tokio::sync::RwLock;
 
 use super::Volume;
+use crate::share_fs::DEFAULT_KATA_GUEST_SANDBOX_DIR;
+use crate::share_fs::PASSTHROUGH_FS_DIR;
 use crate::share_fs::{MountedInfo, ShareFs, ShareFsVolumeConfig};
 use kata_types::mount;
+use oci_spec::runtime as oci;
 
 const SYS_MOUNT_PREFIX: [&str; 2] = ["/proc", "/sys"];
 
@@ -36,9 +46,16 @@ impl ShareFsVolume {
         share_fs: &Option<Arc<dyn ShareFs>>,
         m: &oci::Mount,
         cid: &str,
+        readonly: bool,
+        agent: Arc<dyn Agent>,
     ) -> Result<Self> {
         // The file_name is in the format of "sandbox-{uuid}-{file_name}"
-        let file_name = Path::new(&m.source).file_name().unwrap().to_str().unwrap();
+        let source_path = get_mount_path(m.source());
+        let file_name = Path::new(&source_path)
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap();
         let file_name = generate_mount_path("sandbox", file_name);
 
         let mut volume = Self {
@@ -48,33 +65,87 @@ impl ShareFsVolume {
         };
         match share_fs {
             None => {
-                let src = match std::fs::canonicalize(&m.source) {
+                let src = match std::fs::canonicalize(&source_path) {
                     Err(err) => {
                         return Err(anyhow!(format!(
                             "failed to canonicalize file {} {:?}",
-                            &m.source, err
+                            &source_path, err
                         )))
                     }
                     Ok(src) => src,
                 };
 
+                // If the mount source is a file, we can copy it to the sandbox
                 if src.is_file() {
-                    // TODO: copy file
-                    debug!(sl!(), "FIXME: copy file {}", &m.source);
-                } else {
+                    // This is where we set the value for the guest path
+                    let dest = [
+                        DEFAULT_KATA_GUEST_SANDBOX_DIR,
+                        PASSTHROUGH_FS_DIR,
+                        file_name.clone().as_str(),
+                    ]
+                    .join("/");
+
                     debug!(
+                        sl!(),
+                        "copy local file {:?} to guest {:?}",
+                        &source_path,
+                        dest.clone()
+                    );
+
+                    // Read file metadata
+                    let file_metadata = std::fs::metadata(src.clone())
+                        .with_context(|| format!("Failed to read metadata from file: {:?}", src))?;
+
+                    // Open file
+                    let mut file = File::open(&src)
+                        .with_context(|| format!("Failed to open file: {:?}", src))?;
+
+                    // Open read file contents to buffer
+                    let mut buffer = Vec::new();
+                    file.read_to_end(&mut buffer)
+                        .with_context(|| format!("Failed to read file: {:?}", src))?;
+
+                    // Create gRPC request
+                    let r = agent::CopyFileRequest {
+                        path: dest.clone(),
+                        file_size: file_metadata.len() as i64,
+                        uid: file_metadata.uid() as i32,
+                        gid: file_metadata.gid() as i32,
+                        file_mode: file_metadata.mode(),
+                        data: buffer,
+                        ..Default::default()
+                    };
+
+                    debug!(sl!(), "copy_file: {:?} to sandbox {:?}", &src, dest.clone());
+
+                    // Issue gRPC request to agent
+                    agent.copy_file(r).await.with_context(|| {
+                        format!(
+                            "copy file request failed: src: {:?}, dest: {:?}",
+                            file_name, dest
+                        )
+                    })?;
+
+                    // append oci::Mount structure to volume mounts
+                    let mut oci_mount = oci::Mount::default();
+                    oci_mount.set_destination(m.destination().clone());
+                    oci_mount.set_typ(Some("bind".to_string()));
+                    oci_mount.set_source(Some(PathBuf::from(&dest)));
+                    oci_mount.set_options(m.options().clone());
+                    volume.mounts.push(oci_mount);
+                } else {
+                    // If not, we can ignore it. Let's issue a warning so that the user knows.
+                    warn!(
                         sl!(),
                         "Ignoring non-regular file as FS sharing not supported. mount: {:?}", m
                     );
                 }
             }
             Some(share_fs) => {
-                let readonly = m.options.iter().any(|opt| opt == "ro");
-
                 let share_fs_mount = share_fs.get_share_fs_mount();
                 let mounted_info_set = share_fs.mounted_info_set();
                 let mut mounted_info_set = mounted_info_set.lock().await;
-                if let Some(mut mounted_info) = mounted_info_set.get(&m.source).cloned() {
+                if let Some(mut mounted_info) = mounted_info_set.get(&source_path).cloned() {
                     // Mounted at least once
                     let guest_path = mounted_info
                         .guest_path
@@ -103,24 +174,25 @@ impl ShareFsVolume {
                     } else {
                         mounted_info.rw_ref_count += 1;
                     }
-                    mounted_info_set.insert(m.source.clone(), mounted_info);
+                    mounted_info_set.insert(source_path.clone(), mounted_info);
 
-                    volume.mounts.push(oci::Mount {
-                        destination: m.destination.clone(),
-                        r#type: "bind".to_string(),
-                        source: guest_path,
-                        options: m.options.clone(),
-                    })
+                    let mut oci_mount = oci::Mount::default();
+                    oci_mount.set_destination(m.destination().clone());
+                    oci_mount.set_typ(Some("bind".to_string()));
+                    oci_mount.set_source(Some(PathBuf::from(&guest_path)));
+                    oci_mount.set_options(m.options().clone());
+
+                    volume.mounts.push(oci_mount);
                 } else {
                     // Not mounted ever
                     let mount_result = share_fs_mount
                         .share_volume(&ShareFsVolumeConfig {
                             // The scope of shared volume is sandbox
                             cid: String::from(""),
-                            source: m.source.clone(),
+                            source: source_path.clone(),
                             target: file_name.clone(),
                             readonly,
-                            mount_options: m.options.clone(),
+                            mount_options: get_mount_options(m.options()).clone(),
                             mount: m.clone(),
                             is_rafs: false,
                         })
@@ -131,17 +203,18 @@ impl ShareFsVolume {
                             .context("convert guest path")?,
                         readonly,
                     );
-                    mounted_info_set.insert(m.source.clone(), mounted_info);
+                    mounted_info_set.insert(source_path.clone(), mounted_info);
                     // set storages for the volume
                     volume.storages = mount_result.storages;
 
                     // set mount for the volume
-                    volume.mounts.push(oci::Mount {
-                        destination: m.destination.clone(),
-                        r#type: "bind".to_string(),
-                        source: mount_result.guest_path,
-                        options: m.options.clone(),
-                    });
+                    let mut oci_mount = oci::Mount::default();
+                    oci_mount.set_destination(m.destination().clone());
+                    oci_mount.set_typ(Some("bind".to_string()));
+                    oci_mount.set_source(Some(PathBuf::from(&mount_result.guest_path)));
+                    oci_mount.set_options(m.options().clone());
+
+                    volume.mounts.push(oci_mount);
                 }
             }
         }
@@ -159,7 +232,7 @@ impl Volume for ShareFsVolume {
         Ok(self.storages.clone())
     }
 
-    async fn cleanup(&self) -> Result<()> {
+    async fn cleanup(&self, _device_manager: &RwLock<DeviceManager>) -> Result<()> {
         let share_fs = match self.share_fs.as_ref() {
             Some(fs) => fs,
             None => return Ok(()),
@@ -170,22 +243,24 @@ impl Volume for ShareFsVolume {
         for m in self.mounts.iter() {
             let (host_source, mut mounted_info) = match mounted_info_set
                 .iter()
-                .find(|entry| entry.1.guest_path.as_os_str().to_str().unwrap() == m.source)
+                .find(|entry| {
+                    entry.1.guest_path.as_os_str().to_str().unwrap() == get_mount_path(m.source())
+                })
                 .map(|entry| (entry.0.to_owned(), entry.1.clone()))
             {
                 Some(entry) => entry,
                 None => {
                     warn!(
                         sl!(),
-                        "The mounted info for guest path {} not found", m.source
+                        "The mounted info for guest path {} not found",
+                        &get_mount_path(m.source())
                     );
                     continue;
                 }
             };
 
             let old_readonly = mounted_info.readonly();
-
-            if m.options.iter().any(|opt| *opt == "ro") {
+            if get_mount_options(m.options()).contains(&"ro".to_owned()) {
                 mounted_info.ro_ref_count -= 1;
             } else {
                 mounted_info.rw_ref_count -= 1;
@@ -226,12 +301,17 @@ impl Volume for ShareFsVolume {
 
         Ok(())
     }
+
+    fn get_device_id(&self) -> Result<Option<String>> {
+        Ok(None)
+    }
 }
 
 pub(crate) fn is_share_fs_volume(m: &oci::Mount) -> bool {
-    (m.r#type == "bind" || m.r#type == mount::KATA_EPHEMERAL_VOLUME_TYPE)
-        && !is_host_device(&m.destination)
-        && !is_system_mount(&m.source)
+    let mount_type = get_mount_type(m);
+    (mount_type == "bind" || mount_type == mount::KATA_EPHEMERAL_VOLUME_TYPE)
+        && !is_host_device(&get_mount_path(&Some(m.destination().clone())))
+        && !is_system_mount(&get_mount_path(m.source()))
 }
 
 fn is_host_device(dest: &str) -> bool {

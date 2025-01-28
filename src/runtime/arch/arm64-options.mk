@@ -6,7 +6,7 @@
 # ARM 64 settings
 
 MACHINETYPE := virt
-KERNELPARAMS :=
+KERNELPARAMS := cgroup_no_v1=all systemd.unified_cgroup_hierarchy=1
 MACHINEACCELERATORS :=
 CPUFEATURES := pmu=off
 
@@ -19,3 +19,8 @@ FCJAILERCMD := jailer
 
 # cloud-hypervisor binary name
 CLHCMD := cloud-hypervisor
+
+DEFSTATICRESOURCEMGMT_CLH := true
+
+# stratovirt binary name
+STRATOVIRTCMD := stratovirt

@@ -12,18 +12,24 @@ mod share_virtio_fs_standalone;
 use share_virtio_fs_standalone::ShareVirtioFsStandalone;
 mod utils;
 use tokio::sync::Mutex;
-pub use utils::{do_get_guest_path, do_get_guest_share_path, get_host_rw_shared_path};
+pub use utils::{
+    do_get_guest_path, do_get_guest_share_path, do_get_host_path, get_host_rw_shared_path,
+};
 mod virtio_fs_share_mount;
 use virtio_fs_share_mount::VirtiofsShareMount;
 pub use virtio_fs_share_mount::EPHEMERAL_PATH;
+pub mod sandbox_bind_mounts;
 
 use std::{collections::HashMap, fmt::Debug, path::PathBuf, sync::Arc};
 
 use agent::Storage;
 use anyhow::{anyhow, Context, Ok, Result};
 use async_trait::async_trait;
-use hypervisor::Hypervisor;
 use kata_types::config::hypervisor::SharedFsInfo;
+use oci_spec::runtime as oci;
+use tokio::sync::RwLock;
+
+use hypervisor::{device::device_manager::DeviceManager, Hypervisor};
 
 const VIRTIO_FS: &str = "virtio-fs";
 const _VIRTIO_FS_NYDUS: &str = "virtio-fs-nydus";
@@ -42,8 +48,16 @@ const RAFS_DIR: &str = "rafs";
 #[async_trait]
 pub trait ShareFs: Send + Sync {
     fn get_share_fs_mount(&self) -> Arc<dyn ShareFsMount>;
-    async fn setup_device_before_start_vm(&self, h: &dyn Hypervisor) -> Result<()>;
-    async fn setup_device_after_start_vm(&self, h: &dyn Hypervisor) -> Result<()>;
+    async fn setup_device_before_start_vm(
+        &self,
+        h: &dyn Hypervisor,
+        d: &RwLock<DeviceManager>,
+    ) -> Result<()>;
+    async fn setup_device_after_start_vm(
+        &self,
+        h: &dyn Hypervisor,
+        d: &RwLock<DeviceManager>,
+    ) -> Result<()>;
     async fn get_storages(&self) -> Result<Vec<Storage>>;
     fn mounted_info_set(&self) -> Arc<Mutex<HashMap<String, MountedInfo>>>;
 }

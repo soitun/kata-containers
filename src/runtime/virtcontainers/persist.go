@@ -200,7 +200,7 @@ func (s *Sandbox) dumpConfig(ss *persistapi.SandboxState) {
 	}
 
 	ss.Config.HypervisorConfig = persistapi.HypervisorConfig{
-		NumVCPUs:                sconfig.HypervisorConfig.NumVCPUs,
+		NumVCPUsF:               sconfig.HypervisorConfig.NumVCPUsF,
 		DefaultMaxVCPUs:         sconfig.HypervisorConfig.DefaultMaxVCPUs,
 		MemorySize:              sconfig.HypervisorConfig.MemorySize,
 		DefaultBridges:          sconfig.HypervisorConfig.DefaultBridges,
@@ -217,8 +217,6 @@ func (s *Sandbox) dumpConfig(ss *persistapi.SandboxState) {
 		CPUFeatures:             sconfig.HypervisorConfig.CPUFeatures,
 		HypervisorPath:          sconfig.HypervisorConfig.HypervisorPath,
 		HypervisorPathList:      sconfig.HypervisorConfig.HypervisorPathList,
-		HypervisorCtlPath:       sconfig.HypervisorConfig.HypervisorCtlPath,
-		HypervisorCtlPathList:   sconfig.HypervisorConfig.HypervisorCtlPathList,
 		JailerPath:              sconfig.HypervisorConfig.JailerPath,
 		JailerPathList:          sconfig.HypervisorConfig.JailerPathList,
 		BlockDeviceDriver:       sconfig.HypervisorConfig.BlockDeviceDriver,
@@ -244,8 +242,6 @@ func (s *Sandbox) dumpConfig(ss *persistapi.SandboxState) {
 		FileBackedMemRootList:   sconfig.HypervisorConfig.FileBackedMemRootList,
 		DisableNestingChecks:    sconfig.HypervisorConfig.DisableNestingChecks,
 		DisableImageNvdimm:      sconfig.HypervisorConfig.DisableImageNvdimm,
-		HotplugVFIOOnRootBus:    sconfig.HypervisorConfig.HotplugVFIOOnRootBus,
-		PCIeRootPort:            sconfig.HypervisorConfig.PCIeRootPort,
 		BootToBeTemplate:        sconfig.HypervisorConfig.BootToBeTemplate,
 		BootFromTemplate:        sconfig.HypervisorConfig.BootFromTemplate,
 		DisableVhostNet:         sconfig.HypervisorConfig.DisableVhostNet,
@@ -442,7 +438,7 @@ func loadSandboxConfig(id string) (*SandboxConfig, error) {
 
 	hconf := savedConf.HypervisorConfig
 	sconfig.HypervisorConfig = HypervisorConfig{
-		NumVCPUs:                hconf.NumVCPUs,
+		NumVCPUsF:               hconf.NumVCPUsF,
 		DefaultMaxVCPUs:         hconf.DefaultMaxVCPUs,
 		MemorySize:              hconf.MemorySize,
 		DefaultBridges:          hconf.DefaultBridges,
@@ -459,8 +455,6 @@ func loadSandboxConfig(id string) (*SandboxConfig, error) {
 		CPUFeatures:             hconf.CPUFeatures,
 		HypervisorPath:          hconf.HypervisorPath,
 		HypervisorPathList:      hconf.HypervisorPathList,
-		HypervisorCtlPath:       hconf.HypervisorCtlPath,
-		HypervisorCtlPathList:   hconf.HypervisorCtlPathList,
 		JailerPath:              hconf.JailerPath,
 		JailerPathList:          hconf.JailerPathList,
 		BlockDeviceDriver:       hconf.BlockDeviceDriver,
@@ -486,8 +480,10 @@ func loadSandboxConfig(id string) (*SandboxConfig, error) {
 		FileBackedMemRootList:   hconf.FileBackedMemRootList,
 		DisableNestingChecks:    hconf.DisableNestingChecks,
 		DisableImageNvdimm:      hconf.DisableImageNvdimm,
-		HotplugVFIOOnRootBus:    hconf.HotplugVFIOOnRootBus,
+		HotPlugVFIO:             hconf.HotPlugVFIO,
+		ColdPlugVFIO:            hconf.ColdPlugVFIO,
 		PCIeRootPort:            hconf.PCIeRootPort,
+		PCIeSwitchPort:          hconf.PCIeSwitchPort,
 		BootToBeTemplate:        hconf.BootToBeTemplate,
 		BootFromTemplate:        hconf.BootFromTemplate,
 		DisableVhostNet:         hconf.DisableVhostNet,

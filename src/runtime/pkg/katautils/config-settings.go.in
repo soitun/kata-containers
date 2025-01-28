@@ -9,6 +9,11 @@
 
 package katautils
 
+import (
+	config "github.com/kata-containers/kata-containers/src/runtime/pkg/device/config"
+	govmmQemu "github.com/kata-containers/kata-containers/src/runtime/pkg/govmm/qemu"
+)
+
 // name is the name of the runtime
 var NAME = "@RUNTIME_NAME@"
 
@@ -39,7 +44,6 @@ var DEFAULTRUNTIMECONFIGURATION = "@CONFIG_PATH@"
 // defaultRuntimeConfiguration.
 var DEFAULTSYSCONFRUNTIMECONFIGURATION = "@SYSCONFIG@"
 var defaultHypervisorPath = "/usr/bin/qemu-system-x86_64"
-var defaultHypervisorCtlPath = "/usr/bin/acrnctl"
 var defaultJailerPath = "/usr/bin/jailer"
 var defaultImagePath = "/usr/share/kata-containers/kata-containers.img"
 var defaultKernelPath = "/usr/share/kata-containers/vmlinuz.container"
@@ -53,6 +57,7 @@ var systemdUnitName = "kata-containers.target"
 
 const defaultKernelParams = ""
 const defaultMachineType = "q35"
+const defaultQgsPort = 4050
 
 const defaultVCPUCount uint32 = 1
 const defaultMaxVCPUCount uint32 = 0
@@ -75,10 +80,9 @@ const defaultEnableIOMMU bool = false
 const defaultEnableIOMMUPlatform bool = false
 const defaultFileBackedMemRootDir string = ""
 const defaultEnableDebug bool = false
+const defaultExtraMonitorSocket govmmQemu.MonitorProtocol = ""
 const defaultDisableNestingChecks bool = false
 const defaultMsize9p uint32 = 8192
-const defaultHotplugVFIOOnRootBus bool = false
-const defaultPCIeRootPort = 0
 const defaultEntropySource = "/dev/urandom"
 const defaultGuestHookPath string = ""
 const defaultVirtioFSCacheMode = "never"
@@ -103,3 +107,14 @@ const defaultVMCacheEndpoint string = "/var/run/kata-containers/cache.sock"
 
 // Default config file used by stateless systems.
 var defaultRuntimeConfiguration = "@CONFIG_PATH@"
+
+const defaultHotPlugVFIO = config.NoPort
+const defaultColdPlugVFIO = config.NoPort
+
+const defaultPCIeRootPort = 0
+const defaultPCIeSwitchPort = 0
+
+const defaultRemoteHypervisorSocket = "/run/peerpod/hypervisor.sock"
+const defaultRemoteHypervisorTimeout = 600
+
+const defaultSnpCertsPath = "/opt/snp/cert_chain.cert"

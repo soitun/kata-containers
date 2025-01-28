@@ -7,7 +7,6 @@ use anyhow::{anyhow, Context, Result};
 use futures::{future, StreamExt, TryStreamExt};
 use ipnetwork::{IpNetwork, Ipv4Network, Ipv6Network};
 use nix::errno::Errno;
-use protobuf::RepeatedField;
 use protocols::types::{ARPNeighbor, IPAddress, IPFamily, Interface, Route};
 use rtnetlink::{new_connection, packet, IpVersion};
 use std::convert::{TryFrom, TryInto};
@@ -83,11 +82,46 @@ impl Handle {
 
         // Add new ip addresses from request
         for ip_address in &iface.IPAddresses {
-            let ip = IpAddr::from_str(ip_address.get_address())?;
-            let mask = ip_address.get_mask().parse::<u8>()?;
+            let ip = IpAddr::from_str(ip_address.address())?;
+            let mask = ip_address.mask().parse::<u8>()?;
 
             self.add_addresses(link.index(), std::iter::once(IpNetwork::new(ip, mask)?))
                 .await?;
+        }
+
+        // we need to update the link's interface name, thus we should rename the existed link whose name
+        // is the same with the link's request name, otherwise, it would update the link failed with the
+        // name conflicted.
+        let mut new_link = None;
+        if link.name() != iface.name {
+            if let Ok(link) = self.find_link(LinkFilter::Name(iface.name.as_str())).await {
+                // Bring down interface if it is UP
+                if link.is_up() {
+                    self.enable_link(link.index(), false).await?;
+                }
+
+                // update the existing interface name with a temporary name, otherwise
+                // it would failed to udpate this interface with an existing name.
+                let mut request = self.handle.link().set(link.index());
+                request.message_mut().header = link.header.clone();
+                let link_name = link.name();
+                let temp_name = link_name.clone() + "_temp";
+
+                request
+                    .name(temp_name.clone())
+                    .execute()
+                    .await
+                    .map_err(|err| {
+                        anyhow!(
+                            "Failed to rename interface {} to {}with error: {}",
+                            link_name,
+                            temp_name,
+                            err
+                        )
+                    })?;
+
+                new_link = Some(link);
+            }
         }
 
         // Update link
@@ -100,7 +134,34 @@ impl Handle {
             .arp(iface.raw_flags & libc::IFF_NOARP as u32 == 0)
             .up()
             .execute()
-            .await?;
+            .await
+            .map_err(|err| {
+                anyhow!(
+                    "Failure in LinkSetRequest for interface {}: {}",
+                    iface.name.as_str(),
+                    err
+                )
+            })?;
+
+        // swap the updated iface's name.
+        if let Some(nlink) = new_link {
+            let mut request = self.handle.link().set(nlink.index());
+            request.message_mut().header = nlink.header.clone();
+
+            request
+                .name(link.name())
+                .up()
+                .execute()
+                .await
+                .map_err(|err| {
+                    anyhow!(
+                        "Error swapping back interface name {} to {}: {}",
+                        nlink.name().as_str(),
+                        link.name(),
+                        err
+                    )
+                })?;
+        }
 
         Ok(())
     }
@@ -152,7 +213,7 @@ impl Handle {
                 .map(|p| p.try_into())
                 .collect::<Result<Vec<IPAddress>>>()?;
 
-            iface.IPAddresses = RepeatedField::from_vec(ips);
+            iface.IPAddresses = ips;
 
             list.push(iface);
         }
@@ -292,7 +353,9 @@ impl Handle {
                 route.device = self.find_link(LinkFilter::Index(index)).await?.name();
             }
 
-            result.push(route);
+            if !route.dest.is_empty() {
+                result.push(route);
+            }
         }
 
         Ok(result)
@@ -334,7 +397,7 @@ impl Handle {
 
             // `rtnetlink` offers a separate request builders for different IP versions (IP v4 and v6).
             // This if branch is a bit clumsy because it does almost the same.
-            if route.get_family() == IPFamily::v6 {
+            if route.family() == IPFamily::v6 {
                 let dest_addr = if !route.dest.is_empty() {
                     Ipv6Network::from_str(&route.dest)?
                 } else {
@@ -368,9 +431,9 @@ impl Handle {
                     if Errno::from_i32(message.code.abs()) != Errno::EEXIST {
                         return Err(anyhow!(
                             "Failed to add IP v6 route (src: {}, dst: {}, gtw: {},Err: {})",
-                            route.get_source(),
-                            route.get_dest(),
-                            route.get_gateway(),
+                            route.source(),
+                            route.dest(),
+                            route.gateway(),
                             message
                         ));
                     }
@@ -409,9 +472,9 @@ impl Handle {
                     if Errno::from_i32(message.code.abs()) != Errno::EEXIST {
                         return Err(anyhow!(
                             "Failed to add IP v4 route (src: {}, dst: {}, gtw: {},Err: {})",
-                            route.get_source(),
-                            route.get_dest(),
-                            route.get_gateway(),
+                            route.source(),
+                            route.dest(),
+                            route.gateway(),
                             message
                         ));
                     }
@@ -506,7 +569,7 @@ impl Handle {
             self.add_arp_neighbor(&neigh).await.map_err(|err| {
                 anyhow!(
                     "Failed to add ARP neighbor {}: {:?}",
-                    neigh.get_toIPAddress().get_address(),
+                    neigh.toIPAddress().address(),
                     err
                 )
             })?;
@@ -725,7 +788,7 @@ impl TryFrom<Address> for IPAddress {
         let mask = format!("{}", value.0.header.prefix_len);
 
         Ok(IPAddress {
-            family,
+            family: family.into(),
             address,
             mask,
             ..Default::default()

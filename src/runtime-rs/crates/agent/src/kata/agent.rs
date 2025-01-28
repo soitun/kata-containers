@@ -6,6 +6,7 @@
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use tracing::instrument;
 use ttrpc::context as ttrpc_ctx;
 
 use kata_types::config::Agent as AgentConfig;
@@ -22,6 +23,7 @@ fn new_ttrpc_ctx(timeout: i64) -> ttrpc_ctx::Context {
 
 #[async_trait]
 impl AgentManager for KataAgent {
+    #[instrument]
     async fn start(&self, address: &str) -> Result<()> {
         info!(sl!(), "begin to connect agent {:?}", address);
         self.set_socket_address(address)
@@ -56,7 +58,7 @@ macro_rules! impl_health_service {
         impl HealthService for KataAgent {
             $(async fn $name(&self, req: $req) -> Result<$resp> {
                 let r = req.into();
-                let (mut client, timeout, _) = self.get_health_client().await.context("get health client")?;
+                let (client, timeout, _) = self.get_health_client().await.context("get health client")?;
                 let resp = client.$name(new_ttrpc_ctx(timeout * MILLISECOND_TO_NANOSECOND), &r).await?;
                 Ok(resp.into())
             })*
@@ -73,9 +75,10 @@ macro_rules! impl_agent {
     ($($name: tt | $req: ty | $resp: ty | $new_timeout: expr),*) => {
         #[async_trait]
         impl Agent for KataAgent {
+            #[instrument(skip(req))]
             $(async fn $name(&self, req: $req) -> Result<$resp> {
                 let r = req.into();
-                let (mut client, mut timeout, _) = self.get_agent_client().await.context("get client")?;
+                let (client, mut timeout, _) = self.get_agent_client().await.context("get client")?;
 
                 // update new timeout
                 if let Some(v) = $new_timeout {
@@ -117,5 +120,8 @@ impl_agent!(
     get_ip_tables | crate::GetIPTablesRequest | crate::GetIPTablesResponse | None,
     set_ip_tables | crate::SetIPTablesRequest | crate::SetIPTablesResponse | None,
     get_volume_stats | crate::VolumeStatsRequest | crate::VolumeStatsResponse | None,
-    resize_volume | crate::ResizeVolumeRequest | crate::Empty | None
+    resize_volume | crate::ResizeVolumeRequest | crate::Empty | None,
+    online_cpu_mem | crate::OnlineCPUMemRequest | crate::Empty | None,
+    get_metrics | crate::Empty | crate::MetricsResponse | None,
+    get_guest_details | crate::GetGuestDetailsRequest | crate::GuestDetailsResponse | None
 );

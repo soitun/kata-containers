@@ -9,13 +9,17 @@ load "${BATS_TEST_DIRNAME}/../../common.bash"
 load "${BATS_TEST_DIRNAME}/tests_common.sh"
 
 setup() {
+
 	pod_name="sysctl-test"
 	get_pod_config_dir
+
+	yaml_file="${pod_config_dir}/pod-sysctl.yaml"
+	add_allow_all_policy_to_yaml "${yaml_file}"
 }
 
 @test "Setting sysctl" {
 	# Create pod
-	kubectl apply -f "${pod_config_dir}/pod-sysctl.yaml"
+	kubectl apply -f "${yaml_file}"
 
 	# Check pod creation
 	kubectl wait --for=condition=Ready --timeout=$timeout pod $pod_name
@@ -27,6 +31,7 @@ setup() {
 }
 
 teardown() {
+
 	# Debugging information
 	kubectl describe "pod/$pod_name"
 

@@ -7,13 +7,16 @@ package virtcontainers
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math/rand"
 	"net"
 	"os"
 	"os/exec"
+	"regexp"
 	"runtime"
 	"sort"
+	"strconv"
 	"time"
 
 	"github.com/containernetworking/plugins/pkg/ns"
@@ -22,8 +25,10 @@ import (
 	otelTrace "go.opentelemetry.io/otel/trace"
 	"golang.org/x/sys/unix"
 
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/config"
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/katautils/katatrace"
 	persistapi "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/persist/api"
+	vctypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/utils"
 )
 
@@ -39,6 +44,7 @@ type LinuxNetwork struct {
 	eps               []Endpoint
 	interworkingModel NetInterworkingModel
 	netNSCreated      bool
+	danConfigPath     string
 }
 
 // NewNetwork creates a new Linux Network from a NetworkConfig.
@@ -66,6 +72,7 @@ func NewNetwork(configs ...*NetworkConfig) (Network, error) {
 		[]Endpoint{},
 		config.InterworkingModel,
 		config.NetworkCreated,
+		config.DanConfigPath,
 	}, nil
 }
 
@@ -122,12 +129,33 @@ func (n *LinuxNetwork) addSingleEndpoint(ctx context.Context, s *Sandbox, netInf
 	}
 
 	if isPhysical {
+		if s.config.HypervisorConfig.ColdPlugVFIO == config.NoPort {
+			// When `cold_plug_vfio` is set to "no-port", the PhysicalEndpoint's VFIO device cannot be attached to the guest VM.
+			// Fail early to prevent the VF interface from being unbound and rebound to the VFIO driver.
+			return nil, fmt.Errorf("unable to add PhysicalEndpoint %s because cold_plug_vfio is disabled", netInfo.Iface.Name)
+		}
 		networkLogger().WithField("interface", netInfo.Iface.Name).Info("Physical network interface found")
 		endpoint, err = createPhysicalEndpoint(netInfo)
 	} else {
 		var socketPath string
 		idx := len(n.eps)
 
+		// Avoid endpoint naming conflicts
+		// When creating a new endpoint, we check existing endpoint names and automatically adjust the naming of the new endpoint to ensure uniqueness.
+		lastIdx := -1
+		if len(n.eps) > 0 {
+			lastEndpoint := n.eps[len(n.eps)-1]
+			re := regexp.MustCompile("[0-9]+")
+			matchStr := re.FindString(lastEndpoint.Name())
+			n, err := strconv.ParseInt(matchStr, 10, 64)
+			if err != nil {
+				return nil, err
+			}
+			lastIdx = int(n)
+		}
+		if idx <= lastIdx {
+			idx = lastIdx + 1
+		}
 		// Check if this is a dummy interface which has a vhost-user socket associated with it
 		socketPath, err = vhostUserSocketPath(netInfo)
 		if err != nil {
@@ -180,7 +208,7 @@ func (n *LinuxNetwork) addSingleEndpoint(ctx context.Context, s *Sandbox, netInf
 
 	networkLogger().WithField("endpoint-type", endpoint.Type()).WithField("hotplug", hotplug).Info("Attaching endpoint")
 	if hotplug {
-		if err := endpoint.HotAttach(ctx, s.hypervisor); err != nil {
+		if err := endpoint.HotAttach(ctx, s); err != nil {
 			return nil, err
 		}
 	} else {
@@ -211,12 +239,17 @@ func (n *LinuxNetwork) addSingleEndpoint(ctx context.Context, s *Sandbox, netInf
 	return endpoint, nil
 }
 
-func (n *LinuxNetwork) removeSingleEndpoint(ctx context.Context, s *Sandbox, idx int, hotplug bool) error {
-	if idx > len(n.eps)-1 {
-		return fmt.Errorf("Endpoint index overflow")
+func (n *LinuxNetwork) removeSingleEndpoint(ctx context.Context, s *Sandbox, endpoint Endpoint, hotplug bool) error {
+	var idx int = len(n.eps)
+	for i, val := range n.eps {
+		if val.HardwareAddr() == endpoint.HardwareAddr() {
+			idx = i
+			break
+		}
 	}
-
-	endpoint := n.eps[idx]
+	if idx == len(n.eps) {
+		return fmt.Errorf("Endpoint not found")
+	}
 
 	if endpoint.GetRxRateLimiter() {
 		networkLogger().WithField("endpoint-type", endpoint.Type()).Info("Deleting rx rate limiter")
@@ -238,7 +271,7 @@ func (n *LinuxNetwork) removeSingleEndpoint(ctx context.Context, s *Sandbox, idx
 	// if required.
 	networkLogger().WithField("endpoint-type", endpoint.Type()).Info("Detaching endpoint")
 	if hotplug && s != nil {
-		if err := endpoint.HotDetach(ctx, s.hypervisor, n.netNSCreated, n.netNSPath); err != nil {
+		if err := endpoint.HotDetach(ctx, s, n.netNSCreated, n.netNSPath); err != nil {
 			return err
 		}
 	} else {
@@ -266,6 +299,27 @@ func (n *LinuxNetwork) endpointAlreadyAdded(netInfo *NetworkInfo) bool {
 	}
 
 	return false
+}
+
+func (n *LinuxNetwork) GetEndpointsNum() (int, error) {
+	netnsHandle, err := netns.GetFromPath(n.netNSPath)
+	if err != nil {
+		return 0, err
+	}
+	defer netnsHandle.Close()
+
+	netlinkHandle, err := netlink.NewHandleAt(netnsHandle)
+	if err != nil {
+		return 0, err
+	}
+	defer netlinkHandle.Close()
+
+	linkList, err := netlinkHandle.LinkList()
+	if err != nil {
+		return 0, err
+	}
+
+	return len(linkList), nil
 }
 
 // Scan the networking namespace through netlink and then:
@@ -332,6 +386,107 @@ func (n *LinuxNetwork) addAllEndpoints(ctx context.Context, s *Sandbox, hotplug 
 	return nil
 }
 
+func convertDanDeviceToNetworkInfo(device *vctypes.DanDevice) (*NetworkInfo, error) {
+	var netInfo NetworkInfo
+	var err error
+	netInfo.Iface.Name = device.Name
+	if netInfo.Iface.HardwareAddr, err = net.ParseMAC(device.GuestMac); err != nil {
+		return nil, fmt.Errorf("bad mac address in DAN config: %v", err)
+	}
+	netInfo.Iface.MTU = int(device.NetworkInfo.Interface.MTU)
+	netInfo.Iface.Flags = net.Flags(device.NetworkInfo.Interface.Flags)
+
+	for _, addr := range device.NetworkInfo.Interface.IPAddresses {
+		a, err := netlink.ParseAddr(addr)
+		if err != nil {
+			return nil, fmt.Errorf("bad IP address in DAN config: %v", err)
+		}
+
+		netInfo.Addrs = append(netInfo.Addrs, *a)
+	}
+
+	for _, route := range device.NetworkInfo.Routes {
+		var r netlink.Route
+		if len(route.Dest) > 0 {
+			if _, r.Dst, err = net.ParseCIDR(route.Dest); err != nil {
+				return nil, fmt.Errorf("bad route dest in DAN config: %v", err)
+			}
+		}
+		r.Src = net.ParseIP(route.Source)
+		r.Gw = net.ParseIP(route.Gateway)
+		r.Scope = netlink.Scope(route.Scope)
+		if len(r.Gw.To4()) == net.IPv4len {
+			r.Family = unix.AF_INET
+		} else {
+			r.Family = unix.AF_INET6
+		}
+
+		netInfo.Routes = append(netInfo.Routes, r)
+	}
+
+	for _, neigh := range device.NetworkInfo.Neighbors {
+		var n netlink.Neigh
+		n.State = int(neigh.State)
+		n.Flags = int(neigh.Flags)
+		if n.HardwareAddr, err = net.ParseMAC(neigh.HardwareAddr); err != nil {
+			return nil, fmt.Errorf("bad neighbor hardware address in DAN config: %v", err)
+		}
+
+		n.IP = net.ParseIP(neigh.IPAddress)
+		netInfo.Neighbors = append(netInfo.Neighbors, n)
+	}
+
+	return &netInfo, nil
+}
+
+// Load network config in DAN config
+// Create the endpoints for the interfaces in Dan.
+func (n *LinuxNetwork) addDanEndpoints() error {
+	if len(n.eps) > 0 {
+		// only load DAN config once
+		return nil
+	}
+
+	jsonData, err := os.ReadFile(n.danConfigPath)
+	if err != nil {
+		return fmt.Errorf("fail to load DAN config file: %v", err)
+	}
+
+	var config vctypes.DanConfig
+	err = json.Unmarshal([]byte(jsonData), &config)
+	if err != nil {
+		return fmt.Errorf("fail to unmarshal DAN config: %v", err)
+	}
+
+	for _, device := range config.Devices {
+		var endpoint Endpoint
+		networkLogger().WithField("interface", device.Name).Info("DAN interface found")
+
+		netInfo, err := convertDanDeviceToNetworkInfo(&device)
+		if err != nil {
+			return err
+		}
+
+		switch device.Device.Type {
+		case vctypes.VfioDanDeviceType:
+			endpoint, err = createVfioEndpoint(device.Device.PciDeviceID, netInfo)
+			if err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("unknown DAN device type: '%s'", device.Device.Type)
+		}
+
+		n.eps = append(n.eps, endpoint)
+	}
+
+	sort.Slice(n.eps, func(i, j int) bool {
+		return n.eps[i].Name() < n.eps[j].Name()
+	})
+
+	return nil
+}
+
 // Run runs a callback in the specified network namespace.
 func (n *LinuxNetwork) Run(ctx context.Context, cb func() error) error {
 	span, _ := n.trace(ctx, "Run")
@@ -349,8 +504,15 @@ func (n *LinuxNetwork) AddEndpoints(ctx context.Context, s *Sandbox, endpointsIn
 	defer span.End()
 
 	if endpointsInfo == nil {
-		if err := n.addAllEndpoints(ctx, s, hotplug); err != nil {
-			return nil, err
+		// If a sandbox has a DAN configuration, it takes priority and will be used exclusively.
+		if n.danConfigPath != "" {
+			if err := n.addDanEndpoints(); err != nil {
+				return nil, err
+			}
+		} else {
+			if err := n.addAllEndpoints(ctx, s, hotplug); err != nil {
+				return nil, err
+			}
 		}
 	} else {
 		for _, ep := range endpointsInfo {
@@ -384,7 +546,7 @@ func (n *LinuxNetwork) RemoveEndpoints(ctx context.Context, s *Sandbox, endpoint
 		eps = endpoints
 	}
 
-	for idx, ep := range eps {
+	for _, ep := range eps {
 		if endpoints != nil {
 			new_ep, _ := findEndpoint(ep, n.eps)
 			if new_ep == nil {
@@ -392,8 +554,13 @@ func (n *LinuxNetwork) RemoveEndpoints(ctx context.Context, s *Sandbox, endpoint
 			}
 		}
 
-		if err := n.removeSingleEndpoint(ctx, s, idx, hotplug); err != nil {
-			return err
+		if err := n.removeSingleEndpoint(ctx, s, ep, hotplug); err != nil {
+			// Log the error instead of returning right away
+			// Proceed to remove the next endpoint so as to clean the network setup as
+			// much as possible.
+			// This is crucial for physical endpoints as we want to bind back the physical
+			// interface to its original host driver.
+			networkLogger().Warnf("Error removing endpoint %v : %v", ep.Name(), err)
 		}
 	}
 
@@ -548,7 +715,7 @@ func xConnectVMNetwork(ctx context.Context, endpoint Endpoint, h Hypervisor) err
 	queues := 0
 	caps := h.Capabilities(ctx)
 	if caps.IsMultiQueueSupported() {
-		queues = int(h.HypervisorConfig().NumVCPUs)
+		queues = int(h.HypervisorConfig().NumVCPUs())
 	}
 
 	disableVhostNet := h.HypervisorConfig().DisableVhostNet

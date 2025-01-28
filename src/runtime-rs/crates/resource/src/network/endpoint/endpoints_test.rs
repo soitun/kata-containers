@@ -6,11 +6,14 @@
 
 #[cfg(test)]
 mod tests {
-    use anyhow::Context;
+    use std::sync::Arc;
+
+    use anyhow::{anyhow, Context, Result};
+    use kata_types::config::hypervisor::TopologyConfigInfo;
     use netlink_packet_route::MACVLAN_MODE_PRIVATE;
     use scopeguard::defer;
-
-    use std::sync::Arc;
+    use tests_utils::load_test_config;
+    use tokio::sync::RwLock;
 
     use crate::network::{
         endpoint::{IPVlanEndpoint, MacVlanEndpoint, VlanEndpoint},
@@ -22,6 +25,30 @@ mod tests {
         network_pair::{NetworkInterface, NetworkPair, TapInterface},
         utils::link::net_test_utils::delete_link,
     };
+    use hypervisor::{device::device_manager::DeviceManager, qemu::Qemu};
+
+    async fn get_device_manager() -> Result<Arc<RwLock<DeviceManager>>> {
+        let hypervisor_name: &str = "qemu";
+        let toml_config = load_test_config(hypervisor_name.to_owned())?;
+        let topo_config = TopologyConfigInfo::new(&toml_config);
+        let hypervisor_config = toml_config
+            .hypervisor
+            .get(hypervisor_name)
+            .ok_or_else(|| anyhow!("failed to get hypervisor for {}", &hypervisor_name))?;
+
+        let hypervisor = Qemu::new();
+        hypervisor
+            .set_hypervisor_config(hypervisor_config.clone())
+            .await;
+
+        let dm = Arc::new(RwLock::new(
+            DeviceManager::new(Arc::new(hypervisor), topo_config.as_ref())
+                .await
+                .context("device manager")?,
+        ));
+
+        Ok(dm)
+    }
 
     // this unit test tests the integrity of MacVlanEndpoint::new()
     #[actix_rt::test]
@@ -32,6 +59,10 @@ mod tests {
         let tap_iface_name = format!("tap{}_kata", idx); // create by NetworkPair::new()
         let dummy_name = format!("dummy{}", idx);
         let vlanid = 123;
+
+        let dm = get_device_manager().await;
+        assert!(dm.is_ok());
+        let d = dm.unwrap();
 
         if let Ok((conn, handle, _)) =
             rtnetlink::new_connection().context("failed to create netlink connection")
@@ -63,11 +94,12 @@ mod tests {
                     .await
                     .context("failed to create manual veth pair")
                 {
-                    if let Ok(mut result) = VlanEndpoint::new(&handle, "", idx, 5)
+                    if let Ok(mut result) = VlanEndpoint::new(&d, &handle, "", idx, 5)
                         .await
                         .context("failed to create new ipvlan endpoint")
                     {
                         let manual = VlanEndpoint {
+                            d,
                             net_pair: NetworkPair {
                                 tap: TapInterface {
                                     id: String::from("uniqueTestID_kata"),
@@ -144,6 +176,9 @@ mod tests {
         let tap_iface_name = format!("tap{}_kata", idx); // create by NetworkPair::new()
         let model_str = TC_FILTER_NET_MODEL_STR;
         let dummy_name = format!("dummy{}", idx);
+        let dm = get_device_manager().await;
+        assert!(dm.is_ok());
+        let d = dm.unwrap();
 
         if let Ok((conn, handle, _)) =
             rtnetlink::new_connection().context("failed to create netlink connection")
@@ -180,6 +215,7 @@ mod tests {
                 {
                     // model here does not matter, could be any of supported models
                     if let Ok(mut result) = MacVlanEndpoint::new(
+                        &d,
                         &handle,
                         manual_macvlan_iface_name.clone().as_str(),
                         idx,
@@ -190,6 +226,7 @@ mod tests {
                     .context("failed to create new macvlan endpoint")
                     {
                         let manual = MacVlanEndpoint {
+                            d,
                             net_pair: NetworkPair {
                                 tap: TapInterface {
                                     id: String::from("uniqueTestID_kata"),
@@ -267,6 +304,9 @@ mod tests {
         let mac_addr = String::from("02:00:CA:FE:00:04");
         let manual_virt_iface_name = format!("eth{}", idx);
         let tap_iface_name = format!("tap{}_kata", idx); // create by kata
+        let dm = get_device_manager().await;
+        assert!(dm.is_ok());
+        let d = dm.unwrap();
 
         if let Ok((conn, handle, _)) =
             rtnetlink::new_connection().context("failed to create netlink connection")
@@ -286,11 +326,12 @@ mod tests {
                 .await
                 .context("failed to create manual veth pair")
             {
-                if let Ok(mut result) = IPVlanEndpoint::new(&handle, "", idx, 5)
+                if let Ok(mut result) = IPVlanEndpoint::new(&d, &handle, "", idx, 5)
                     .await
                     .context("failed to create new ipvlan endpoint")
                 {
                     let manual = IPVlanEndpoint {
+                        d,
                         net_pair: NetworkPair {
                             tap: TapInterface {
                                 id: String::from("uniqueTestID_kata"),

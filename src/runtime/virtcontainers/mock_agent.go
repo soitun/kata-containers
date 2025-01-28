@@ -141,6 +141,11 @@ func (n *mockAgent) waitProcess(ctx context.Context, c *Container, processID str
 	return 0, nil
 }
 
+// removeStaleVirtiofsShareMounts is the Noop agent removeStaleVirtiofsShareMounts implementation. It does nothing.
+func (n *mockAgent) removeStaleVirtiofsShareMounts(ctx context.Context) error {
+	return nil
+}
+
 // winsizeProcess is the Noop agent process tty resizer. It does nothing.
 func (n *mockAgent) winsizeProcess(ctx context.Context, c *Container, processID string, height, width uint32) error {
 	return nil
@@ -260,5 +265,9 @@ func (k *mockAgent) getIPTables(ctx context.Context, isIPv6 bool) ([]byte, error
 }
 
 func (k *mockAgent) setIPTables(ctx context.Context, isIPv6 bool, data []byte) error {
+	return nil
+}
+
+func (k *mockAgent) setPolicy(ctx context.Context, policy string) error {
 	return nil
 }

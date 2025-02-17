@@ -4,10 +4,13 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-use anyhow::Result;
-use async_trait::async_trait;
+use hypervisor::device::device_manager::DeviceManager;
+use tokio::sync::RwLock;
 
 use super::Volume;
+use anyhow::Result;
+use async_trait::async_trait;
+use oci_spec::runtime as oci;
 
 #[derive(Debug)]
 pub(crate) struct DefaultVolume {
@@ -33,9 +36,13 @@ impl Volume for DefaultVolume {
         Ok(vec![])
     }
 
-    async fn cleanup(&self) -> Result<()> {
+    async fn cleanup(&self, _device_manager: &RwLock<DeviceManager>) -> Result<()> {
         // TODO: Clean up DefaultVolume
         warn!(sl!(), "Cleaning up DefaultVolume is still unimplemented.");
         Ok(())
+    }
+
+    fn get_device_id(&self) -> Result<Option<String>> {
+        Ok(None)
     }
 }

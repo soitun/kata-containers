@@ -117,9 +117,17 @@ func TestQemuArchBaseKernelParameters(t *testing.T) {
 func TestQemuArchBaseCapabilities(t *testing.T) {
 	assert := assert.New(t)
 	qemuArchBase := newQemuArchBase()
+	hConfig := HypervisorConfig{}
+	hConfig.SharedFS = config.VirtioFS
 
-	c := qemuArchBase.capabilities()
+	c := qemuArchBase.capabilities(hConfig)
 	assert.True(c.IsBlockDeviceHotplugSupported())
+	assert.True(c.IsFsSharingSupported())
+	assert.True(c.IsNetworkDeviceHotplugSupported())
+
+	hConfig.SharedFS = config.NoSharedFS
+	c = qemuArchBase.capabilities(hConfig)
+	assert.False(c.IsFsSharingSupported())
 }
 
 func TestQemuArchBaseBridges(t *testing.T) {
@@ -463,7 +471,7 @@ func TestQemuArchBaseAppendVFIODevice(t *testing.T) {
 		},
 	}
 
-	vfDevice := config.VFIOPCIDev{
+	vfDevice := config.VFIODev{
 		BDF: bdf,
 	}
 
@@ -483,7 +491,7 @@ func TestQemuArchBaseAppendVFIODeviceWithVendorDeviceID(t *testing.T) {
 		},
 	}
 
-	vfDevice := config.VFIOPCIDev{
+	vfDevice := config.VFIODev{
 		BDF:      bdf,
 		VendorID: vendorID,
 		DeviceID: deviceID,

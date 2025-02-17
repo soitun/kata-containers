@@ -10,13 +10,15 @@ load "${BATS_TEST_DIRNAME}/tests_common.sh"
 
 setup() {
 	[ "${KATA_HYPERVISOR}" == "firecracker" ] && skip "test not working see: ${fc_limitations}"
+	[ "${KATA_HYPERVISOR}" == "fc" ] && skip "test not working see: ${fc_limitations}"
 
 	get_pod_config_dir
+
+	pod_yaml="${pod_config_dir}/pod-projected-volume.yaml"
+	add_allow_all_policy_to_yaml "${pod_yaml}"
 }
 
 @test "Projected volume" {
-	[ "${KATA_HYPERVISOR}" == "firecracker" ] && skip "test not working see: ${fc_limitations}"
-
 	password="1f2d1e2e67df"
 	username="admin"
 	pod_name="test-projected-volume"
@@ -33,7 +35,7 @@ setup() {
 	kubectl create secret generic pass --from-file=$SECOND_TMP_FILE
 
 	# Create pod
-	kubectl create -f "${pod_config_dir}/pod-projected-volume.yaml"
+	kubectl create -f "${pod_yaml}"
 
 	# Check pod creation
 	kubectl wait --for=condition=Ready --timeout=$timeout pod "$pod_name"
@@ -53,6 +55,7 @@ setup() {
 
 teardown() {
 	[ "${KATA_HYPERVISOR}" == "firecracker" ] && skip "test not working see: ${fc_limitations}"
+	[ "${KATA_HYPERVISOR}" == "fc" ] && skip "test not working see: ${fc_limitations}"
 
 	# Debugging information
 	kubectl describe "pod/$pod_name"

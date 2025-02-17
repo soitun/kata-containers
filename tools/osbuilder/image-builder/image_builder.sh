@@ -11,6 +11,17 @@ set -o errexit
 set -o pipefail
 
 DOCKER_RUNTIME=${DOCKER_RUNTIME:-runc}
+MEASURED_ROOTFS=${MEASURED_ROOTFS:-no}
+
+#For cross build
+CROSS_BUILD=${CROSS_BUILD:-false}
+BUILDX=""
+PLATFORM=""
+TARGET_ARCH=${TARGET_ARCH:-$(uname -m)}
+ARCH=${ARCH:-$(uname -m)}
+[ "${TARGET_ARCH}" == "aarch64" ] && TARGET_ARCH=arm64
+TARGET_OS=${TARGET_OS:-linux}
+[ "${CROSS_BUILD}" == "true" ] && BUILDX=buildx && PLATFORM="--platform=${TARGET_OS}/${TARGET_ARCH}"
 
 readonly script_name="${0##*/}"
 readonly script_dir=$(dirname "$(readlink -f "$0")")
@@ -18,7 +29,6 @@ readonly lib_file="${script_dir}/../scripts/lib.sh"
 
 readonly ext4_format="ext4"
 readonly xfs_format="xfs"
-readonly erofs_format="erofs"
 
 # ext4: percentage of the filesystem which may only be allocated by privileged processes.
 readonly reserved_blocks_percentage=3
@@ -38,30 +48,6 @@ readonly dax_header_sz=2
 # * DAX huge pages [2]: 2MB alignment
 # [2] - https://nvdimm.wiki.kernel.org/2mib_fs_dax
 readonly dax_alignment=2
-
-# The list of systemd units and files that are not needed in Kata Containers
-readonly -a systemd_units=(
-	"systemd-coredump@"
-	"systemd-journald"
-	"systemd-journald-dev-log"
-	"systemd-journal-flush"
-	"systemd-random-seed"
-	"systemd-timesyncd"
-	"systemd-tmpfiles-setup"
-	"systemd-udevd"
-	"systemd-udevd-control"
-	"systemd-udevd-kernel"
-	"systemd-udev-trigger"
-	"systemd-update-utmp"
-)
-
-readonly -a systemd_files=(
-	"systemd-bless-boot-generator"
-	"systemd-fstab-generator"
-	"systemd-getty-generator"
-	"systemd-gpt-auto-generator"
-	"systemd-tmpfiles-cleanup.timer"
-)
 
 # Set a default value
 AGENT_INIT=${AGENT_INIT:-no}
@@ -153,7 +139,7 @@ build_with_container() {
 		engine_build_args+=" --runtime ${DOCKER_RUNTIME}"
 	fi
 
-	"${container_engine}" build  \
+	"${container_engine}" ${BUILDX} build ${PLATFORM}  \
 		   ${engine_build_args} \
 		   --build-arg http_proxy="${http_proxy}" \
 		   --build-arg https_proxy="${https_proxy}" \
@@ -185,8 +171,13 @@ build_with_container() {
 		   --env BLOCK_SIZE="${block_size}" \
 		   --env ROOT_FREE_SPACE="${root_free_space}" \
 		   --env NSDAX_BIN="${nsdax_bin}" \
+		   --env MEASURED_ROOTFS="${MEASURED_ROOTFS}" \
 		   --env SELINUX="${SELINUX}" \
 		   --env DEBUG="${DEBUG}" \
+		   --env ARCH="${ARCH}" \
+		   --env TARGET_ARCH="${TARGET_ARCH}" \
+		   --env USER="$(id -u)" \
+		   --env GROUP="$(id -g)" \
 		   -v /dev:/dev \
 		   -v "${script_dir}":"/osbuilder" \
 		   -v "${script_dir}/../scripts":"/scripts" \
@@ -391,9 +382,26 @@ create_disk() {
 	# Kata runtime expect an image with just one partition
 	# The partition is the rootfs content
 	info "Creating partitions"
+
+	if [ "${rootfs_end}" == "-1" ]; then
+		rootfs_end_unit="s"
+	else
+		rootfs_end_unit="MiB"
+	fi
+	if [ "${MEASURED_ROOTFS}" == "yes" ]; then
+		info "Creating partitions with hash device"
+		# The hash data will take less than one percent disk space to store
+		hash_start=$(echo $img_size | awk '{print $1 * 0.99}' |cut -d $(locale decimal_point) -f 1)
+		partition_param="mkpart primary ${fs_type} ${part_start}MiB ${hash_start}MiB "
+		partition_param+="mkpart primary ${fs_type} ${hash_start}MiB ${rootfs_end}${rootfs_end_unit} "
+		partition_param+="set 1 boot on"
+	else
+		partition_param="mkpart primary ${fs_type} ${part_start}MiB ${rootfs_end}${rootfs_end_unit}"
+	fi
+
 	parted -s -a optimal "${image}" -- \
 		   mklabel msdos \
-		   mkpart primary "${fs_type}" "${part_start}"M "${rootfs_end}"M
+		   "${partition_param}"
 
 	OK "Partitions created"
 }
@@ -414,11 +422,6 @@ setup_selinux() {
 				chroot "${mount_dir}" command -v restorecon > /dev/null; then
 				mount -t selinuxfs selinuxfs "$selinuxfs_path"
 				chroot "${mount_dir}" restorecon -RF -e ${SELINUXFS} /
-				# TODO: This operation will be removed after the updated container-selinux that
-				# includes the following commit is released.
-				# https://github.com/containers/container-selinux/commit/39f83cc74d50bd10ab6be4d0bdd98bc04857469f
-				# We use chcon as an interim solution until then.
-				chroot "${mount_dir}" chcon -t container_runtime_exec_t "/usr/bin/${agent_bin}"
 				umount "${selinuxfs_path}"
 			else
 				die "Could not label the rootfs. Make sure that SELinux is enabled on the host \
@@ -428,21 +431,6 @@ setup_selinux() {
 }
 
 setup_systemd() {
-		local mount_dir="$1"
-
-		info "Removing unneeded systemd services and sockets"
-		for u in "${systemd_units[@]}"; do
-			find "${mount_dir}" -type f \( \
-				 -name "${u}.service" -o \
-				 -name "${u}.socket" \) \
-				 -exec rm -f {} \;
-		done
-
-		info "Removing unneeded systemd files"
-		for u in "${systemd_files[@]}"; do
-			find "${mount_dir}" -type f -name "${u}" -exec rm -f {} \;
-		done
-
 		info "Creating empty machine-id to allow systemd to bind-mount it"
 		touch "${mount_dir}/etc/machine-id"
 }
@@ -488,6 +476,12 @@ create_rootfs_image() {
 
 	if [ "${fs_type}" = "${ext4_format}" ]; then
 		fsck.ext4 -D -y "${device}p1"
+	fi
+
+	if [ "${MEASURED_ROOTFS}" == "yes" ] && [ -b "${device}p2" ]; then
+		info "veritysetup format rootfs device: ${device}p1, hash device: ${device}p2"
+		local image_dir=$(dirname "${image}")
+		veritysetup format "${device}p1" "${device}p2" > "${image_dir}"/root_hash.txt 2>&1
 	fi
 
 	losetup -d "${device}"
@@ -577,9 +571,6 @@ set_dax_header() {
 }
 
 main() {
-	[ "$(id -u)" -eq 0 ] || die "$0: must be run as root"
-	[ "$#" -eq 0 ] && usage && return 0
-
 	# variables that can be overwritten by environment variables
 	local agent_bin="${AGENT_BIN:-kata-agent}"
 	local agent_init="${AGENT_INIT:-no}"
@@ -646,6 +637,8 @@ main() {
 	fi
 	# insert at the beginning of the image the MBR + DAX header
 	set_dax_header "${image}" "${img_size}" "${fs_type}" "${nsdax_bin}"
+
+	chown "${USER}:${GROUP}" "${image}"
 }
 
 main "$@"

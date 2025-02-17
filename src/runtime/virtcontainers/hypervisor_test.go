@@ -7,10 +7,12 @@ package virtcontainers
 
 import (
 	"fmt"
+	"os"
+	"strings"
+	"testing"
+
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
 	"github.com/stretchr/testify/assert"
-	"os"
-	"testing"
 )
 
 func TestGetKernelRootParams(t *testing.T) {
@@ -185,6 +187,10 @@ func TestSetMockHypervisorType(t *testing.T) {
 	testSetHypervisorType(t, "mock", MockHypervisor)
 }
 
+func TestSetRemoteHypervisorType(t *testing.T) {
+	testSetHypervisorType(t, "remote", RemoteHypervisor)
+}
+
 func TestSetUnknownHypervisorType(t *testing.T) {
 	var hypervisorType HypervisorType
 	assert := assert.New(t)
@@ -206,6 +212,11 @@ func TestStringFromQemuHypervisorType(t *testing.T) {
 	testStringFromHypervisorType(t, hypervisorType, "qemu")
 }
 
+func TestStringFromRemoteHypervisorType(t *testing.T) {
+	hypervisorType := RemoteHypervisor
+	testStringFromHypervisorType(t, hypervisorType, "remote")
+}
+
 func TestStringFromMockHypervisorType(t *testing.T) {
 	hypervisorType := MockHypervisor
 	testStringFromHypervisorType(t, hypervisorType, "mock")
@@ -221,6 +232,12 @@ func testNewHypervisorFromHypervisorType(t *testing.T, hypervisorType Hypervisor
 	hy, err := NewHypervisor(hypervisorType)
 	assert.NoError(err)
 	assert.Exactly(hy, expected)
+}
+
+func TestNewHypervisorFromRemoteHypervisorType(t *testing.T) {
+	hypervisorType := RemoteHypervisor
+	expectedHypervisor := &remoteHypervisor{}
+	testNewHypervisorFromHypervisorType(t, hypervisorType, expectedHypervisor)
 }
 
 func TestNewHypervisorFromMockHypervisorType(t *testing.T) {
@@ -459,8 +476,7 @@ func TestAssetPath(t *testing.T) {
 	// The values are "paths" (start with a slash), but end with the
 	// annotation name.
 	cfg := HypervisorConfig{
-		HypervisorPath:    "/" + "io.katacontainers.config.hypervisor.path",
-		HypervisorCtlPath: "/" + "io.katacontainers.config.hypervisor.ctlpath",
+		HypervisorPath: "/" + "io.katacontainers.config.hypervisor.path",
 
 		KernelPath: "/" + "io.katacontainers.config.hypervisor.kernel",
 
@@ -488,5 +504,139 @@ func TestAssetPath(t *testing.T) {
 
 		expected := fmt.Sprintf("/%s", annoPath)
 		assert.Equal(expected, p, msg)
+	}
+}
+
+func TestKernelParamFields(t *testing.T) {
+	assert := assert.New(t)
+	tests := []struct {
+		cmdLine                         string
+		expectedFieldsResult            []string
+		expectedKernelParamFieldsResult []string
+	}{
+		{
+			cmdLine: "a=b x=y",
+			expectedFieldsResult: []string{
+				"a=b",
+				"x=y",
+			},
+			expectedKernelParamFieldsResult: []string{
+				"a=b",
+				"x=y",
+			},
+		},
+		{
+			cmdLine: "a=b x=y  foo=bar",
+			expectedFieldsResult: []string{
+				"a=b",
+				"x=y",
+				"foo=bar",
+			},
+			expectedKernelParamFieldsResult: []string{
+				"a=b",
+				"x=y",
+				"foo=bar",
+			},
+		},
+		{
+			cmdLine: "a x=y  foo=bar",
+			expectedFieldsResult: []string{
+				"a",
+				"x=y",
+				"foo=bar",
+			},
+			expectedKernelParamFieldsResult: []string{
+				"a",
+				"x=y",
+				"foo=bar",
+			},
+		},
+		{
+			cmdLine: "a=b      x foo=bar",
+			expectedFieldsResult: []string{
+				"a=b",
+				"x",
+				"foo=bar",
+			},
+			expectedKernelParamFieldsResult: []string{
+				"a=b",
+				"x",
+				"foo=bar",
+			},
+		},
+		{
+			cmdLine: "a=b      x foo     ",
+			expectedFieldsResult: []string{
+				"a=b",
+				"x",
+				"foo",
+			},
+			expectedKernelParamFieldsResult: []string{
+				"a=b",
+				"x",
+				"foo",
+			},
+		},
+		{
+			cmdLine: "a=b x=\"y z\"",
+			expectedFieldsResult: []string{
+				"a=b",
+				"x=\"y",
+				"z\"",
+			},
+			expectedKernelParamFieldsResult: []string{
+				"a=b",
+				"x=\"y z\"",
+			},
+		},
+		{
+			cmdLine: "foo=\"bar baz\"",
+			expectedFieldsResult: []string{
+				"foo=\"bar",
+				"baz\"",
+			},
+			expectedKernelParamFieldsResult: []string{
+				"foo=\"bar baz\"",
+			},
+		},
+		{
+			cmdLine: "foo=\"bar baz\"           abc=\"123\"",
+			expectedFieldsResult: []string{
+				"foo=\"bar",
+				"baz\"",
+				"abc=\"123\"",
+			},
+			expectedKernelParamFieldsResult: []string{
+				"foo=\"bar baz\"",
+				"abc=\"123\"",
+			},
+		},
+		{
+			cmdLine: "\"a=b",
+			expectedFieldsResult: []string{
+				"\"a=b",
+			},
+			expectedKernelParamFieldsResult: []string{
+				"\"a=b",
+			},
+		},
+		{
+			cmdLine: "\"a=b    x=y",
+			expectedFieldsResult: []string{
+				"\"a=b",
+				"x=y",
+			},
+			expectedKernelParamFieldsResult: []string{
+				"\"a=b    x=y",
+			},
+		},
+	}
+
+	for _, t := range tests {
+		params := strings.Fields(t.cmdLine)
+		assert.Equal(params, t.expectedFieldsResult, "Unexpected strings.Fields behavior")
+
+		params = KernelParamFields(t.cmdLine)
+		assert.Equal(params, t.expectedKernelParamFieldsResult, "Unexpected KernelParamFields behavior")
 	}
 }

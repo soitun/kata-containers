@@ -15,7 +15,7 @@ PROJECT_COMPONENT = kata-agent
 TARGET = $(PROJECT_COMPONENT)
 
 VERSION_FILE := ./VERSION
-VERSION := $(shell grep -v ^\# $(VERSION_FILE))
+VERSION := $(shell grep -v ^\# $(VERSION_FILE) 2>/dev/null || echo "unknown")
 COMMIT_NO := $(shell git rev-parse HEAD 2>/dev/null || true)
 COMMIT := $(if $(shell git status --porcelain --untracked-files=no 2>/dev/null || true),${COMMIT_NO}-dirty,${COMMIT_NO})
 COMMIT_MSG = $(if $(COMMIT),$(COMMIT),unknown)
@@ -26,11 +26,35 @@ export VERSION_COMMIT := $(if $(COMMIT),$(VERSION)-$(COMMIT),$(VERSION))
 EXTRA_RUSTFEATURES :=
 
 ##VAR SECCOMP=yes|no define if agent enables seccomp feature
-SECCOMP := yes
+SECCOMP ?= yes
 
 # Enable seccomp feature of rust build
 ifeq ($(SECCOMP),yes)
     override EXTRA_RUSTFEATURES += seccomp
+endif
+
+##VAR AGENT_POLICY=yes|no define if agent enables the policy feature
+AGENT_POLICY ?= no
+
+# Enable the policy feature of rust build
+ifeq ($(AGENT_POLICY),yes)
+    override EXTRA_RUSTFEATURES += agent-policy
+endif
+
+##VAR PULL_TYPE=default|guest-pull define if agent enables the guest pull image feature
+PULL_TYPE ?= default
+ifeq ($(PULL_TYPE),default)
+    override EXTRA_RUSTFEATURES += default-pull
+# Enable guest pull image feature of rust build
+else ifeq ($(PULL_TYPE),guest-pull)
+    override EXTRA_RUSTFEATURES += guest-pull
+endif
+
+
+include ../../utils.mk
+
+ifeq ($(ARCH), ppc64le)
+    override ARCH = powerpc64le
 endif
 
 ##VAR STANDARD_OCI_RUNTIME=yes|no define if agent enables standard oci runtime feature
@@ -45,12 +69,10 @@ ifneq ($(EXTRA_RUSTFEATURES),)
     override EXTRA_RUSTFEATURES := --features "$(EXTRA_RUSTFEATURES)"
 endif
 
-include ../../utils.mk
-
 TARGET_PATH = target/$(TRIPLE)/$(BUILD_TYPE)/$(TARGET)
 
 ##VAR DESTDIR=<path> is a directory prepended to each installed target file
-DESTDIR :=
+DESTDIR ?=
 ##VAR BINDIR=<path> is a directory for installing executable programs
 BINDIR := /usr/bin
 
@@ -136,8 +158,8 @@ vendor:
 
 
 #TARGET test: run cargo tests
-test:
-	@cargo test --all --target $(TRIPLE) $(EXTRA_RUSTFEATURES) -- --nocapture
+test: $(GENERATED_FILES)
+	@RUST_LIB_BACKTRACE=0 RUST_BACKTRACE=1 cargo test --all --target $(TRIPLE) $(EXTRA_RUSTFEATURES) -- --nocapture
 
 ##TARGET check: run test
 check: $(GENERATED_FILES) standard_rust_check

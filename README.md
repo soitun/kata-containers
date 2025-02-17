@@ -1,4 +1,6 @@
-<img src="https://www.openstack.org/assets/kata/kata-vertical-on-white.png" width="150">
+<img src="https://object-storage-ca-ymq-1.vexxhost.net/swift/v1/6e4619c416ff4bd19e1c087f27a43eea/www-images-prod/openstack-logo/kata/SVG/kata-1.svg" width="900">
+
+[![CI | Publish Kata Containers payload](https://github.com/kata-containers/kata-containers/actions/workflows/payload-after-push.yaml/badge.svg)](https://github.com/kata-containers/kata-containers/actions/workflows/payload-after-push.yaml) [![Kata Containers Nightly CI](https://github.com/kata-containers/kata-containers/actions/workflows/ci-nightly.yaml/badge.svg)](https://github.com/kata-containers/kata-containers/actions/workflows/ci-nightly.yaml)
 
 # Kata Containers
 
@@ -121,7 +123,7 @@ The table below lists the core parts of the project:
 | [agent](src/agent) | core | Management process running inside the virtual machine / POD that sets up the container environment. |
 | [`dragonball`](src/dragonball) | core | An optional built-in VMM brings out-of-the-box Kata Containers experience with optimizations on container workloads |
 | [documentation](docs) | documentation | Documentation common to all components (such as design and install documentation). |
-| [tests](https://github.com/kata-containers/tests) | tests | Excludes unit tests which live with the main code. |
+| [tests](tests) | tests | Excludes unit tests which live with the main code. |
 
 ### Additional components
 
@@ -132,19 +134,28 @@ The table below lists the remaining parts of the project:
 | [packaging](tools/packaging) | infrastructure | Scripts and metadata for producing packaged binaries<br/>(components, hypervisors, kernel and rootfs). |
 | [kernel](https://www.kernel.org) | kernel | Linux kernel used by the hypervisor to boot the guest image. Patches are stored [here](tools/packaging/kernel). |
 | [osbuilder](tools/osbuilder) | infrastructure | Tool to create "mini O/S" rootfs and initrd images and kernel for the hypervisor. |
+| [kata-debug](tools/packaging/kata-debug/README.md) | infrastructure | Utility tool to gather Kata Containers debug information from Kubernetes clusters. |
 | [`agent-ctl`](src/tools/agent-ctl) | utility | Tool that provides low-level access for testing the agent. |
 | [`kata-ctl`](src/tools/kata-ctl) | utility | Tool that provides advanced commands and debug facilities. |
 | [`trace-forwarder`](src/tools/trace-forwarder) | utility | Agent tracing helper. |
 | [`runk`](src/tools/runk) | utility | Standard OCI container runtime based on the agent. |
-| [`ci`](https://github.com/kata-containers/ci) | CI | Continuous Integration configuration files and scripts. |
+| [`ci`](.github/workflows) | CI | Continuous Integration configuration files and scripts. |
+| [`ocp-ci`](ci/openshift-ci/README.md) | CI | Continuous Integration configuration for the OpenShift pipelines. |
 | [`katacontainers.io`](https://github.com/kata-containers/www.katacontainers.io) | Source for the [`katacontainers.io`](https://www.katacontainers.io) site. |
+| [`Webhook`](tools/testing/kata-webhook/README.md) | utility | Example of a simple admission controller webhook to annotate pods with the Kata runtime class |
 
 ### Packaging and releases
 
 Kata Containers is now
 [available natively for most distributions](docs/install/README.md#packaged-installation-methods).
-However, packaging scripts and metadata are still used to generate [snap](snap/local) and GitHub releases. See
-the [components](#components) section for further details.
+
+## General tests
+
+See the [tests documentation](tests/README.md).
+
+## Metrics tests
+
+See the [metrics documentation](tests/metrics/README.md).
 
 ## Glossary of Terms
 

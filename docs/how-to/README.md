@@ -20,12 +20,10 @@
    for the VM rootfs. Refer to the following guide for additional configuration
    steps:
    - [Setup Kata containers with `firecracker`](how-to-use-kata-containers-with-firecracker.md)
-- `ACRN`
 
-  While `qemu` , `cloud-hypervisor` and `firecracker` work out of the box with installation of Kata,
-  some additional configuration is needed in case of `ACRN`.
-  Refer to the following guides for additional configuration steps:
-- [Kata Containers with ACRN Hypervisor](how-to-use-kata-containers-with-acrn.md)
+## Confidential Containers Policy
+
+- [How to auto-generate policy](../../src/tools/genpolicy/README.md)
 
 ## Advanced Topics
 
@@ -44,4 +42,8 @@
 - [How to run Docker with Kata Containers](how-to-run-docker-with-kata.md)
 - [How to run Kata Containers with `nydus`](how-to-use-virtio-fs-nydus-with-kata.md)
 - [How to run Kata Containers with AMD SEV-SNP](how-to-run-kata-containers-with-SNP-VMs.md)
+- [How to run Kata Containers with IBM Secure Execution](how-to-run-kata-containers-with-SE-VMs.md)
 - [How to use EROFS to build rootfs in Kata Containers](how-to-use-erofs-build-rootfs.md)
+- [How to run Kata Containers with kinds of Block Volumes](how-to-run-kata-containers-with-kinds-of-Block-Volumes.md)
+- [How to use the Kata Agent Policy](how-to-use-the-kata-agent-policy.md)
+- [How to pull images in the guest](how-to-pull-images-in-guest-with-kata.md)

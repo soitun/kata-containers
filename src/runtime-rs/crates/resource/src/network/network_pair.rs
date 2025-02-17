@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-use std::{convert::TryFrom, sync::Arc, usize};
+use std::{convert::TryFrom, sync::Arc};
 
 use anyhow::{anyhow, Context, Result};
 use futures::stream::TryStreamExt;
@@ -39,6 +39,7 @@ pub struct NetworkPair {
     pub model: Arc<dyn network_model::NetworkModel>,
     pub network_qos: bool,
 }
+
 impl NetworkPair {
     pub(crate) async fn new(
         handle: &rtnetlink::Handle,

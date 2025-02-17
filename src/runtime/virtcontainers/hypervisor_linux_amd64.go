@@ -8,9 +8,7 @@ package virtcontainers
 import "os"
 
 const (
-	tdxSysFirmwareDir = "/sys/firmware/tdx_seam/"
-
-	tdxCPUFlag = "tdx"
+	tdxKvmParameterPath = "/sys/module/kvm_intel/parameters/tdx"
 
 	sevKvmParameterPath = "/sys/module/kvm_amd/parameters/sev"
 
@@ -19,14 +17,11 @@ const (
 
 // Implementation of this function is architecture specific
 func availableGuestProtection() (guestProtection, error) {
-	flags, err := CPUFlags(procCPUInfo)
-	if err != nil {
-		return noneProtection, err
-	}
-
-	// TDX is supported and properly loaded when the firmware directory exists or `tdx` is part of the CPU flags
-	if d, err := os.Stat(tdxSysFirmwareDir); (err == nil && d.IsDir()) || flags[tdxCPUFlag] {
-		return tdxProtection, nil
+	// TDX is supported and enabled when the kvm module 'tdx' parameter is set to 'Y'
+	if _, err := os.Stat(tdxKvmParameterPath); err == nil {
+		if c, err := os.ReadFile(tdxKvmParameterPath); err == nil && len(c) > 0 && (c[0] == 'Y') {
+			return tdxProtection, nil
+		}
 	}
 	// SEV-SNP is supported and enabled when the kvm module `sev_snp` parameter is set to `Y`
 	// SEV-SNP support infers SEV (-ES) support

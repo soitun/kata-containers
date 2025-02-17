@@ -5,12 +5,12 @@
 //
 
 use crate::HypervisorConfig;
+use kata_sys_util::protection::GuestProtection;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-
 #[derive(Serialize, Deserialize, Default, Clone, Debug)]
 pub struct HypervisorState {
-    // Type of hypervisor, E.g. dragonball/qemu/firecracker/acrn.
+    // Type of hypervisor, E.g. dragonball/qemu/firecracker.
     pub hypervisor_type: String,
     pub pid: Option<i32>,
     pub uuid: String,
@@ -33,4 +33,7 @@ pub struct HypervisorState {
     /// cached block device
     pub cached_block_devices: HashSet<String>,
     pub virtiofs_daemon_pid: i32,
+    pub passfd_listener_port: Option<u32>,
+    /// guest protection
+    pub guest_protection_to_use: GuestProtection,
 }

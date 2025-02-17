@@ -11,11 +11,50 @@ pub use vendor::AgentVendor;
 
 use super::default::{
     DEFAULT_AGENT_DIAL_TIMEOUT_MS, DEFAULT_AGENT_LOG_PORT, DEFAULT_AGENT_VSOCK_PORT,
+    DEFAULT_PASSFD_LISTENER_PORT,
 };
 use crate::eother;
 
 /// agent name of Kata agent.
 pub const AGENT_NAME_KATA: &str = "kata";
+
+#[derive(Default, Debug, Deserialize, Serialize, Clone)]
+pub struct MemAgent {
+    #[serde(default, alias = "mem_agent_enable")]
+    pub enable: bool,
+
+    #[serde(default)]
+    pub memcg_disable: Option<bool>,
+    #[serde(default)]
+    pub memcg_swap: Option<bool>,
+    #[serde(default)]
+    pub memcg_swappiness_max: Option<u8>,
+    #[serde(default)]
+    pub memcg_period_secs: Option<u64>,
+    #[serde(default)]
+    pub memcg_period_psi_percent_limit: Option<u8>,
+    #[serde(default)]
+    pub memcg_eviction_psi_percent_limit: Option<u8>,
+    #[serde(default)]
+    pub memcg_eviction_run_aging_count_min: Option<u64>,
+
+    #[serde(default)]
+    pub compact_disable: Option<bool>,
+    #[serde(default)]
+    pub compact_period_secs: Option<u64>,
+    #[serde(default)]
+    pub compact_period_psi_percent_limit: Option<u8>,
+    #[serde(default)]
+    pub compact_psi_percent_limit: Option<u8>,
+    #[serde(default)]
+    pub compact_sec_max: Option<i64>,
+    #[serde(default)]
+    pub compact_order: Option<u8>,
+    #[serde(default)]
+    pub compact_threshold: Option<u64>,
+    #[serde(default)]
+    pub compact_force_times: Option<u64>,
+}
 
 /// Kata agent configuration information.
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -23,6 +62,17 @@ pub struct Agent {
     /// If enabled, the agent will log additional debug messages to the system log.
     #[serde(default, rename = "enable_debug")]
     pub debug: bool,
+
+    /// The log log level will be applied to agent.
+    /// Possible values are:
+    /// - trace
+    /// - debug
+    /// - info
+    /// - warn
+    /// - error
+    /// - critical
+    #[serde(default = "default_agent_log_level")]
+    pub log_level: String,
 
     /// Enable agent tracing.
     ///
@@ -48,6 +98,10 @@ pub struct Agent {
     /// Agent log port
     #[serde(default = "default_log_port")]
     pub log_port: u32,
+
+    /// Agent process io port
+    #[serde(default = "default_passfd_listener_port")]
+    pub passfd_listener_port: u32,
 
     /// Agent connection dialing timeout value in millisecond
     #[serde(default = "default_dial_timeout")]
@@ -80,25 +134,37 @@ pub struct Agent {
     pub kernel_modules: Vec<String>,
 
     /// container pipe size
+    #[serde(default)]
     pub container_pipe_size: u32,
+
+    /// Memory agent configuration
+    #[serde(default)]
+    pub mem_agent: MemAgent,
 }
 
 impl std::default::Default for Agent {
     fn default() -> Self {
         Self {
             debug: true,
+            log_level: "info".to_string(),
             enable_tracing: false,
             debug_console_enabled: false,
             server_port: DEFAULT_AGENT_VSOCK_PORT,
             log_port: DEFAULT_AGENT_LOG_PORT,
+            passfd_listener_port: DEFAULT_PASSFD_LISTENER_PORT,
             dial_timeout_ms: DEFAULT_AGENT_DIAL_TIMEOUT_MS,
             reconnect_timeout_ms: 3_000,
             request_timeout_ms: 30_000,
             health_check_request_timeout_ms: 90_000,
             kernel_modules: Default::default(),
             container_pipe_size: 0,
+            mem_agent: MemAgent::default(),
         }
     }
+}
+
+fn default_agent_log_level() -> String {
+    String::from("info")
 }
 
 fn default_server_port() -> u32 {
@@ -107,6 +173,10 @@ fn default_server_port() -> u32 {
 
 fn default_log_port() -> u32 {
     DEFAULT_AGENT_LOG_PORT
+}
+
+fn default_passfd_listener_port() -> u32 {
+    DEFAULT_PASSFD_LISTENER_PORT
 }
 
 fn default_dial_timeout() -> u32 {

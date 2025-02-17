@@ -18,6 +18,7 @@ import (
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/oci"
 	vc "github.com/kata-containers/kata-containers/src/runtime/virtcontainers"
 	vf "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/factory"
+	vcAnnotations "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/annotations"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
 
@@ -129,7 +130,7 @@ func CreateSandbox(ctx context.Context, vci vc.VC, ociSpec specs.Spec, runtimeCo
 	}
 
 	if !rootFs.Mounted && len(sandboxConfig.Containers) == 1 {
-		if rootFs.Source != "" {
+		if rootFs.Source != "" && !vc.HasOptionPrefix(rootFs.Options, vc.VirtualVolumePrefix) {
 			realPath, err := ResolvePath(rootFs.Source)
 			if err != nil {
 				return nil, vc.Process{}, err
@@ -161,6 +162,10 @@ func CreateSandbox(ctx context.Context, vci vc.VC, ociSpec specs.Spec, runtimeCo
 	}
 	ociSpec.Annotations["nerdctl/network-namespace"] = sandboxConfig.NetworkConfig.NetworkID
 	sandboxConfig.Annotations["nerdctl/network-namespace"] = ociSpec.Annotations["nerdctl/network-namespace"]
+
+	// The value of this annotation is sent to the sandbox using SetPolicy.
+	delete(ociSpec.Annotations, vcAnnotations.Policy)
+	delete(sandboxConfig.Annotations, vcAnnotations.Policy)
 
 	sandbox, err := vci.CreateSandbox(ctx, sandboxConfig, func(ctx context.Context) error {
 		// Run pre-start OCI hooks, in the runtime namespace.
@@ -228,6 +233,9 @@ func CreateContainer(ctx context.Context, sandbox vc.VCSandbox, ociSpec specs.Sp
 	katatrace.AddTags(span, "container_id", containerID)
 	defer span.End()
 
+	// The value of this annotation is sent to the sandbox using SetPolicy.
+	delete(ociSpec.Annotations, vcAnnotations.Policy)
+
 	ociSpec = SetEphemeralStorageType(ociSpec, disableGuestEmptyDir)
 
 	contConfig, err := oci.ContainerConfig(ociSpec, bundlePath, containerID, disableOutput)
@@ -236,7 +244,7 @@ func CreateContainer(ctx context.Context, sandbox vc.VCSandbox, ociSpec specs.Sp
 	}
 
 	if !rootFs.Mounted {
-		if rootFs.Source != "" && rootFs.Type != vc.NydusRootFSType {
+		if rootFs.Source != "" && !vc.IsNydusRootFSType(rootFs.Type) {
 			realPath, err := ResolvePath(rootFs.Source)
 			if err != nil {
 				return vc.Process{}, err
@@ -263,9 +271,18 @@ func CreateContainer(ctx context.Context, sandbox vc.VCSandbox, ociSpec specs.Sp
 	}
 	ctx = context.WithValue(ctx, vc.HypervisorPidKey{}, hid)
 
-	// Run pre-start OCI hooks.
 	err = EnterNetNS(sandbox.GetNetNs(), func() error {
-		return PreStartHooks(ctx, ociSpec, containerID, bundlePath)
+		// Run pre-start OCI hooks, in the runtime namespace.
+		if err := PreStartHooks(ctx, ociSpec, containerID, bundlePath); err != nil {
+			return err
+		}
+
+		// Run create runtime OCI hooks, in the runtime namespace.
+		if err := CreateRuntimeHooks(ctx, ociSpec, containerID, bundlePath); err != nil {
+			return err
+		}
+
+		return nil
 	})
 	if err != nil {
 		return vc.Process{}, err

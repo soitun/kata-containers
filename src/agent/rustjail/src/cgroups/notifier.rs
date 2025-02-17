@@ -3,24 +3,23 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-use anyhow::{anyhow, Context, Result};
-use eventfd::{eventfd, EfdFlags};
-use nix::sys::eventfd;
 use std::fs::{self, File};
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::Path;
 
-use crate::pipestream::PipeStream;
+use anyhow::{anyhow, Context, Result};
+use eventfd::{eventfd, EfdFlags};
 use futures::StreamExt as _;
 use inotify::{Inotify, WatchMask};
+use nix::sys::eventfd;
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc::{channel, Receiver};
 
-// Convenience macro to obtain the scope logger
-macro_rules! sl {
-    () => {
-        slog_scope::logger().new(o!("subsystem" => "cgroups_notifier"))
-    };
+use crate::pipestream::PipeStream;
+
+// Convenience function to obtain the scope logger.
+fn sl() -> slog::Logger {
+    slog_scope::logger().new(o!("subsystem" => "cgroups_notifier"))
 }
 
 pub async fn notify_oom(cid: &str, cg_dir: String) -> Result<Receiver<String>> {
@@ -38,7 +37,7 @@ pub async fn notify_oom(cid: &str, cg_dir: String) -> Result<Receiver<String>> {
 fn get_value_from_cgroup(path: &Path, key: &str) -> Result<i64> {
     let content = fs::read_to_string(path)?;
     info!(
-        sl!(),
+        sl(),
         "get_value_from_cgroup file: {:?}, content: {}", &path, &content
     );
 
@@ -67,11 +66,11 @@ async fn register_memory_event_v2(
     let event_control_path = Path::new(&cg_dir).join(memory_event_name);
     let cgroup_event_control_path = Path::new(&cg_dir).join(cgroup_event_name);
     info!(
-        sl!(),
+        sl(),
         "register_memory_event_v2 event_control_path: {:?}", &event_control_path
     );
     info!(
-        sl!(),
+        sl(),
         "register_memory_event_v2 cgroup_event_control_path: {:?}", &cgroup_event_control_path
     );
 
@@ -82,8 +81,8 @@ async fn register_memory_event_v2(
     // Because no `unix.IN_DELETE|unix.IN_DELETE_SELF` event for cgroup file system, so watching all process exited
     let cg_wd = inotify.add_watch(&cgroup_event_control_path, WatchMask::MODIFY)?;
 
-    info!(sl!(), "ev_wd: {:?}", ev_wd);
-    info!(sl!(), "cg_wd: {:?}", cg_wd);
+    info!(sl(), "ev_wd: {:?}", ev_wd);
+    info!(sl(), "cg_wd: {:?}", cg_wd);
 
     let (sender, receiver) = channel(100);
     let containere_id = containere_id.to_string();
@@ -97,17 +96,17 @@ async fn register_memory_event_v2(
         while let Some(event_or_error) = stream.next().await {
             let event = event_or_error.unwrap();
             info!(
-                sl!(),
+                sl(),
                 "container[{}] get event for container: {:?}", &containere_id, &event
             );
             // info!("is1: {}", event.wd == wd1);
-            info!(sl!(), "event.wd: {:?}", event.wd);
+            info!(sl(), "event.wd: {:?}", event.wd);
 
             if event.wd == ev_wd {
                 let oom = get_value_from_cgroup(&event_control_path, "oom_kill");
                 if oom.unwrap_or(0) > 0 {
                     let _ = sender.send(containere_id.clone()).await.map_err(|e| {
-                        error!(sl!(), "send containere_id failed, error: {:?}", e);
+                        error!(sl(), "send containere_id failed, error: {:?}", e);
                     });
                     return;
                 }
@@ -167,22 +166,22 @@ async fn register_memory_event(
 
     tokio::spawn(async move {
         loop {
-            let sender = sender.clone();
             let mut buf = [0u8; 8];
             match eventfd_stream.read(&mut buf).await {
                 Err(err) => {
-                    warn!(sl!(), "failed to read from eventfd: {:?}", err);
+                    warn!(sl(), "failed to read from eventfd: {:?}", err);
                     return;
                 }
                 Ok(_) => {
-                    let content = fs::read_to_string(path.clone());
-                    info!(
-                        sl!(),
-                        "cgroup event for container: {}, path: {:?}, content: {:?}",
-                        &containere_id,
-                        &path,
-                        content
-                    );
+                    if let Ok(times) = get_value_from_cgroup(&path, "oom_kill") {
+                        if times < 1 {
+                            // Do not send an OOM event in the case where no OOM has occurred
+                            continue;
+                        }
+                    }
+                    // Send an OOM event in two cases:
+                    // 1. The value is not empty && times > 0: OOM kill has occurred.
+                    // 2. The value is empty: Do what previous implemention did.
                 }
             }
 
@@ -193,7 +192,7 @@ async fn register_memory_event(
             }
 
             let _ = sender.send(containere_id.clone()).await.map_err(|e| {
-                error!(sl!(), "send containere_id failed, error: {:?}", e);
+                error!(sl(), "send containere_id failed, error: {:?}", e);
             });
         }
     });

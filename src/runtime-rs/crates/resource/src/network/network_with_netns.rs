@@ -4,16 +4,21 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-use std::sync::{
-    atomic::{AtomicU32, Ordering},
-    Arc,
+use std::{
+    fs,
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc,
+    },
 };
 
 use super::endpoint::endpoint_persist::EndpointState;
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use futures::stream::TryStreamExt;
-use hypervisor::Hypervisor;
+use hypervisor::{device::device_manager::DeviceManager, Hypervisor};
+use kata_sys_util::netns;
+use netns_rs::get_from_path;
 use scopeguard::defer;
 use tokio::sync::RwLock;
 
@@ -22,8 +27,8 @@ use super::{
         Endpoint, IPVlanEndpoint, MacVlanEndpoint, PhysicalEndpoint, VethEndpoint, VlanEndpoint,
     },
     network_entity::NetworkEntity,
-    network_info::network_info_from_link::NetworkInfoFromLink,
-    utils::{link, netns},
+    network_info::network_info_from_link::{handle_addresses, NetworkInfoFromLink},
+    utils::link,
     Network,
 };
 use crate::network::NetworkInfo;
@@ -33,27 +38,36 @@ pub struct NetworkWithNetNsConfig {
     pub network_model: String,
     pub netns_path: String,
     pub queues: usize,
+    pub network_created: bool,
 }
 
 struct NetworkWithNetnsInner {
     netns_path: String,
     entity_list: Vec<NetworkEntity>,
+    network_created: bool,
 }
 
 impl NetworkWithNetnsInner {
-    async fn new(config: &NetworkWithNetNsConfig) -> Result<Self> {
+    async fn new(config: &NetworkWithNetNsConfig, d: Arc<RwLock<DeviceManager>>) -> Result<Self> {
         let entity_list = if config.netns_path.is_empty() {
-            warn!(sl!(), "skip to scan for empty netns");
+            warn!(sl!(), "Skip to scan network for empty netns");
+            vec![]
+        } else if config.network_model.as_str() == "none" {
+            warn!(
+                sl!(),
+                "Skip to scan network from netns due to the none network model"
+            );
             vec![]
         } else {
             // get endpoint
-            get_entity_from_netns(config)
+            get_entity_from_netns(config, d)
                 .await
                 .context("get entity from netns")?
         };
         Ok(Self {
             netns_path: config.netns_path.to_string(),
             entity_list,
+            network_created: config.network_created,
         })
     }
 }
@@ -63,20 +77,23 @@ pub(crate) struct NetworkWithNetns {
 }
 
 impl NetworkWithNetns {
-    pub(crate) async fn new(config: &NetworkWithNetNsConfig) -> Result<Self> {
+    pub(crate) async fn new(
+        config: &NetworkWithNetNsConfig,
+        d: Arc<RwLock<DeviceManager>>,
+    ) -> Result<Self> {
         Ok(Self {
-            inner: Arc::new(RwLock::new(NetworkWithNetnsInner::new(config).await?)),
+            inner: Arc::new(RwLock::new(NetworkWithNetnsInner::new(config, d).await?)),
         })
     }
 }
 
 #[async_trait]
 impl Network for NetworkWithNetns {
-    async fn setup(&self, h: &dyn Hypervisor) -> Result<()> {
+    async fn setup(&self) -> Result<()> {
         let inner = self.inner.read().await;
         let _netns_guard = netns::NetnsGuard::new(&inner.netns_path).context("net netns guard")?;
         for e in &inner.entity_list {
-            e.endpoint.attach(h).await.context("attach")?;
+            e.endpoint.attach().await.context("attach")?;
         }
         Ok(())
     }
@@ -120,12 +137,35 @@ impl Network for NetworkWithNetns {
         }
         Some(endpoint)
     }
+
+    async fn remove(&self, h: &dyn Hypervisor) -> Result<()> {
+        let inner = self.inner.read().await;
+        // The network namespace would have been deleted at this point
+        // if it has not been created by virtcontainers.
+        if !inner.network_created {
+            return Ok(());
+        }
+        {
+            let _netns_guard =
+                netns::NetnsGuard::new(&inner.netns_path).context("net netns guard")?;
+            for e in &inner.entity_list {
+                e.endpoint.detach(h).await.context("detach")?;
+            }
+        }
+        let netns = get_from_path(inner.netns_path.clone())?;
+        netns.remove()?;
+        fs::remove_dir_all(inner.netns_path.clone()).context("failed to remove netns path")?;
+        Ok(())
+    }
 }
 
-async fn get_entity_from_netns(config: &NetworkWithNetNsConfig) -> Result<Vec<NetworkEntity>> {
+async fn get_entity_from_netns(
+    config: &NetworkWithNetNsConfig,
+    d: Arc<RwLock<DeviceManager>>,
+) -> Result<Vec<NetworkEntity>> {
     info!(
         sl!(),
-        "get network entity for config {:?} tid {:?}",
+        "get network entity from config {:?} tid {:?}",
         config,
         nix::unistd::gettid()
     );
@@ -150,10 +190,20 @@ async fn get_entity_from_netns(config: &NetworkWithNetNsConfig) -> Result<Vec<Ne
             continue;
         }
 
-        let idx = idx.fetch_add(1, Ordering::Relaxed);
-        let (endpoint, network_info) = create_endpoint(&handle, link.as_ref(), idx, config)
+        let ip_addresses = handle_addresses(&handle, attrs)
             .await
-            .context("create endpoint")?;
+            .context("handle addresses")?;
+        // Ignore unconfigured network interfaces. These are either base tunnel devices that are not namespaced
+        // like gre0, gretap0, sit0, ipip0, tunl0 or incorrectly setup interfaces.
+        if ip_addresses.is_empty() {
+            continue;
+        }
+
+        let idx = idx.fetch_add(1, Ordering::Relaxed);
+        let (endpoint, network_info) =
+            create_endpoint(&handle, link.as_ref(), ip_addresses, idx, config, d.clone())
+                .await
+                .context("create endpoint")?;
 
         entity_list.push(NetworkEntity::new(endpoint, network_info));
     }
@@ -164,8 +214,10 @@ async fn get_entity_from_netns(config: &NetworkWithNetNsConfig) -> Result<Vec<Ne
 async fn create_endpoint(
     handle: &rtnetlink::Handle,
     link: &dyn link::Link,
+    addrs: Vec<agent::IPAddress>,
     idx: u32,
     config: &NetworkWithNetNsConfig,
+    d: Arc<RwLock<DeviceManager>>,
 ) -> Result<(Arc<dyn Endpoint>, Arc<dyn NetworkInfo>)> {
     let _netns_guard = netns::NetnsGuard::new(&config.netns_path)
         .context("net netns guard")
@@ -179,7 +231,7 @@ async fn create_endpoint(
             &attrs.name,
             nix::unistd::gettid()
         );
-        let t = PhysicalEndpoint::new(&attrs.name, &attrs.hardware_addr)
+        let t = PhysicalEndpoint::new(&attrs.name, &attrs.hardware_addr, d)
             .context("new physical endpoint")?;
         Arc::new(t)
     } else {
@@ -190,6 +242,7 @@ async fn create_endpoint(
         match link_type {
             "veth" => {
                 let ret = VethEndpoint::new(
+                    &d,
                     handle,
                     &attrs.name,
                     idx,
@@ -201,19 +254,20 @@ async fn create_endpoint(
                 Arc::new(ret)
             }
             "vlan" => {
-                let ret = VlanEndpoint::new(handle, &attrs.name, idx, config.queues)
+                let ret = VlanEndpoint::new(&d, handle, &attrs.name, idx, config.queues)
                     .await
                     .context("vlan endpoint")?;
                 Arc::new(ret)
             }
             "ipvlan" => {
-                let ret = IPVlanEndpoint::new(handle, &attrs.name, idx, config.queues)
+                let ret = IPVlanEndpoint::new(&d, handle, &attrs.name, idx, config.queues)
                     .await
                     .context("ipvlan endpoint")?;
                 Arc::new(ret)
             }
             "macvlan" => {
                 let ret = MacVlanEndpoint::new(
+                    &d,
                     handle,
                     &attrs.name,
                     idx,
@@ -229,7 +283,7 @@ async fn create_endpoint(
     };
 
     let network_info = Arc::new(
-        NetworkInfoFromLink::new(handle, link, &endpoint.hardware_addr().await)
+        NetworkInfoFromLink::new(handle, link, addrs, &endpoint.hardware_addr().await)
             .await
             .context("network info from link")?,
     );

@@ -28,6 +28,8 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/vishvananda/netlink"
 
+	cri "github.com/containerd/containerd/pkg/cri/annotations"
+	crio "github.com/containers/podman/v4/pkg/annotations"
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/api"
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/config"
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/drivers"
@@ -100,15 +102,10 @@ type HypervisorPidKey struct{}
 
 // SandboxStatus describes a sandbox status.
 type SandboxStatus struct {
-	ContainersStatus []ContainerStatus
-
-	// Annotations allow clients to store arbitrary values,
-	// for example to add additional status values required
-	// to support particular specifications.
-	Annotations map[string]string
-
+	Annotations      map[string]string
 	ID               string
 	Hypervisor       HypervisorType
+	ContainersStatus []ContainerStatus
 	State            types.SandboxState
 	HypervisorConfig HypervisorConfig
 }
@@ -121,9 +118,9 @@ type SandboxStats struct {
 
 type SandboxResourceSizing struct {
 	// The number of CPUs required for the sandbox workload(s)
-	WorkloadCPUs uint32
+	WorkloadCPUs float32
 	// The base number of CPUs for the VM that are assigned as overhead
-	BaseCPUs uint32
+	BaseCPUs float32
 	// The amount of memory required for the sandbox workload(s)
 	WorkloadMemMB uint32
 	// The base amount of memory required for that VM that is assigned as overhead
@@ -175,10 +172,8 @@ type SandboxConfig struct {
 
 	// SharePidNs sets all containers to share the same sandbox level pid namespace.
 	SharePidNs bool
-
 	// SystemdCgroup enables systemd cgroup support
 	SystemdCgroup bool
-
 	// SandboxCgroupOnly enables cgroup only at podlevel in the host
 	SandboxCgroupOnly bool
 
@@ -187,6 +182,10 @@ type SandboxConfig struct {
 
 	// EnableVCPUsPinning controls whether each vCPU thread should be scheduled to a fixed CPU
 	EnableVCPUsPinning bool
+
+	// Create container timeout which, if provided, indicates the create container timeout
+	// needed for the workload(s)
+	CreateContainerTimeout uint64
 }
 
 // valid checks that the sandbox configuration is valid.
@@ -249,6 +248,11 @@ type Sandbox struct {
 	seccompSupported  bool
 	disableVMShutdown bool
 	isVCPUsPinningOn  bool
+
+	// hotplugNetworkConfigApplied prevents network config API being called
+	// multiple times for hot-plugged network device when Sandbox has multiple
+	// containers.
+	hotplugNetworkConfigApplied bool
 }
 
 // ID returns the sandbox identifier string.
@@ -338,6 +342,7 @@ func (s *Sandbox) Release(ctx context.Context) error {
 	if s.monitor != nil {
 		s.monitor.stop()
 	}
+	s.fsShare.StopFileEventWatcher(ctx)
 	s.hypervisor.Disconnect(ctx)
 	return s.agent.disconnect(ctx)
 }
@@ -448,13 +453,25 @@ func createAssets(ctx context.Context, sandboxConfig *SandboxConfig) error {
 	defer span.End()
 
 	for _, name := range types.AssetTypes() {
-		a, err := types.NewAsset(sandboxConfig.Annotations, name)
+		annotation, _, err := name.Annotations()
 		if err != nil {
 			return err
 		}
+		// For remote hypervisor donot check for Absolute Path incase of ImagePath, as it denotes the name of the image.
+		if sandboxConfig.HypervisorType == RemoteHypervisor && annotation == annotations.ImagePath {
+			value := sandboxConfig.Annotations[annotation]
+			if value != "" {
+				sandboxConfig.HypervisorConfig.ImagePath = value
+			}
+		} else {
+			a, err := types.NewAsset(sandboxConfig.Annotations, name)
+			if err != nil {
+				return err
+			}
 
-		if err := sandboxConfig.HypervisorConfig.AddCustomAsset(a); err != nil {
-			return err
+			if err := sandboxConfig.HypervisorConfig.AddCustomAsset(a); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -620,6 +637,34 @@ func newSandbox(ctx context.Context, sandboxConfig SandboxConfig, factory Factor
 		return nil, err
 	}
 
+	// Start the event loop if not already started when fs sharing is not used
+	if sandboxConfig.HypervisorConfig.SharedFS == config.NoSharedFS {
+		// Start the StartFileEventWatcher method as a goroutine
+		// to monitor the file events.
+		go func() {
+			if err := s.fsShare.StartFileEventWatcher(ctx); err != nil {
+				s.Logger().WithError(err).Error("Failed to start file event watcher")
+				return
+			}
+		}()
+
+		// Stop the file event watcher on error
+		defer func() {
+			if retErr != nil {
+				s.Logger().WithError(retErr).Error("Stopping File Event Watcher")
+				s.fsShare.StopFileEventWatcher(ctx)
+			}
+		}()
+
+	}
+
+	setHypervisorConfigAnnotations(&sandboxConfig)
+
+	coldPlugVFIO, err := s.coldOrHotPlugVFIO(&sandboxConfig)
+	if err != nil {
+		return nil, err
+	}
+
 	// store doesn't require hypervisor to be stored immediately
 	if err = s.hypervisor.CreateVM(ctx, s.id, s.network, &sandboxConfig.HypervisorConfig); err != nil {
 		return nil, err
@@ -629,7 +674,155 @@ func newSandbox(ctx context.Context, sandboxConfig SandboxConfig, factory Factor
 		return nil, err
 	}
 
+	if !coldPlugVFIO {
+		return s, nil
+	}
+
+	for _, dev := range sandboxConfig.HypervisorConfig.VFIODevices {
+		s.Logger().Info("cold-plug device: ", dev)
+		_, err := s.AddDevice(ctx, dev)
+		if err != nil {
+			s.Logger().WithError(err).Debug("Cannot cold-plug add device")
+			return nil, err
+		}
+	}
 	return s, nil
+}
+
+func setHypervisorConfigAnnotations(sandboxConfig *SandboxConfig) {
+	if len(sandboxConfig.Containers) > 0 {
+		// These values are required by remote hypervisor
+		for _, a := range []string{cri.SandboxName, crio.SandboxName} {
+			if value, ok := sandboxConfig.Containers[0].Annotations[a]; ok {
+				sandboxConfig.HypervisorConfig.SandboxName = value
+			}
+		}
+
+		for _, a := range []string{cri.SandboxNamespace, crio.Namespace} {
+			if value, ok := sandboxConfig.Containers[0].Annotations[a]; ok {
+				sandboxConfig.HypervisorConfig.SandboxNamespace = value
+			}
+		}
+	}
+}
+
+func (s *Sandbox) coldOrHotPlugVFIO(sandboxConfig *SandboxConfig) (bool, error) {
+	// If we have a confidential guest we need to cold-plug the PCIe VFIO devices
+	// until we have TDISP/IDE PCIe support.
+	coldPlugVFIO := (sandboxConfig.HypervisorConfig.ColdPlugVFIO != config.NoPort)
+	// Aggregate all the containner devices for hot-plug and use them to dedcue
+	// the correct amount of ports to reserve for the hypervisor.
+	hotPlugVFIO := (sandboxConfig.HypervisorConfig.HotPlugVFIO != config.NoPort)
+
+	//modeIsGK := (sandboxConfig.VfioMode == config.VFIOModeGuestKernel)
+	// modeIsVFIO is needed at the container level not the sandbox level.
+	// modeIsVFIO := (sandboxConfig.VfioMode == config.VFIOModeVFIO)
+
+	var vfioDevices []config.DeviceInfo
+	// vhost-user-block device is a PCIe device in Virt, keep track of it
+	// for correct number of PCIe root ports.
+	var vhostUserBlkDevices []config.DeviceInfo
+
+	//io.katacontainers.pkg.oci.container_type:pod_sandbox
+
+	for cnt, container := range sandboxConfig.Containers {
+		// Do not alter the original spec, we do not want to inject
+		// CDI devices into the sandbox container, were using the CDI
+		// devices as additional information to determine the number of
+		// PCIe root ports to reserve for the hypervisor.
+		// A single_container type will have the CDI devices injected
+		// only do this if we're a pod_sandbox type.
+		if container.Annotations["io.katacontainers.pkg.oci.container_type"] == "pod_sandbox" && container.CustomSpec != nil {
+			cdiSpec := container.CustomSpec
+			// We can provide additional directories where to search for
+			// CDI specs if needed. immutable OS's only have specific
+			// directories where applications can write too. For instance /opt/cdi
+			//
+			// _, err = withCDI(ociSpec.Annotations, []string{"/opt/cdi"}, ociSpec)
+			//
+			_, err := config.WithCDI(cdiSpec.Annotations, []string{}, cdiSpec)
+			if err != nil {
+				return coldPlugVFIO, fmt.Errorf("adding CDI devices failed")
+			}
+
+			for _, dev := range cdiSpec.Linux.Devices {
+				isVFIODevice := deviceManager.IsVFIODevice(dev.Path)
+				if hotPlugVFIO && isVFIODevice {
+					vfioDev := config.DeviceInfo{
+						ColdPlug:      true,
+						ContainerPath: dev.Path,
+						Port:          sandboxConfig.HypervisorConfig.HotPlugVFIO,
+						DevType:       dev.Type,
+						Major:         dev.Major,
+						Minor:         dev.Minor,
+					}
+					if dev.FileMode != nil {
+						vfioDev.FileMode = *dev.FileMode
+					}
+					if dev.UID != nil {
+						vfioDev.UID = *dev.UID
+					}
+					if dev.GID != nil {
+						vfioDev.GID = *dev.GID
+					}
+
+					vfioDevices = append(vfioDevices, vfioDev)
+					continue
+				}
+				if coldPlugVFIO && isVFIODevice {
+					vfioDev := config.DeviceInfo{
+						ColdPlug:      true,
+						ContainerPath: dev.Path,
+						Port:          sandboxConfig.HypervisorConfig.ColdPlugVFIO,
+						DevType:       dev.Type,
+						Major:         dev.Major,
+						Minor:         dev.Minor,
+					}
+					if dev.FileMode != nil {
+						vfioDev.FileMode = *dev.FileMode
+					}
+					if dev.UID != nil {
+						vfioDev.UID = *dev.UID
+					}
+					if dev.GID != nil {
+						vfioDev.GID = *dev.GID
+					}
+
+					vfioDevices = append(vfioDevices, vfioDev)
+					continue
+				}
+			}
+		}
+		// As stated before the single_container will have the  CDI
+		// devices injected by the runtime. For the pod_container use-case
+		// see container.go how cold and hot-plug are handled.
+		for dev, device := range container.DeviceInfos {
+			if deviceManager.IsVhostUserBlk(device) {
+				vhostUserBlkDevices = append(vhostUserBlkDevices, device)
+				continue
+			}
+			isVFIODevice := deviceManager.IsVFIODevice(device.ContainerPath)
+			if hotPlugVFIO && isVFIODevice {
+				device.ColdPlug = false
+				device.Port = sandboxConfig.HypervisorConfig.HotPlugVFIO
+				vfioDevices = append(vfioDevices, device)
+				sandboxConfig.Containers[cnt].DeviceInfos[dev].Port = sandboxConfig.HypervisorConfig.HotPlugVFIO
+				continue
+			}
+			if coldPlugVFIO && isVFIODevice {
+				device.ColdPlug = true
+				device.Port = sandboxConfig.HypervisorConfig.ColdPlugVFIO
+				vfioDevices = append(vfioDevices, device)
+				sandboxConfig.Containers[cnt].DeviceInfos[dev].Port = sandboxConfig.HypervisorConfig.ColdPlugVFIO
+				continue
+			}
+		}
+	}
+
+	sandboxConfig.HypervisorConfig.VFIODevices = vfioDevices
+	sandboxConfig.HypervisorConfig.VhostUserBlkDevices = vhostUserBlkDevices
+
+	return coldPlugVFIO, nil
 }
 
 func (s *Sandbox) createResourceController() error {
@@ -666,6 +859,7 @@ func (s *Sandbox) createResourceController() error {
 			// Determine if device /dev/null and /dev/urandom exist, and add if they don't
 			nullDeviceExist := false
 			urandomDeviceExist := false
+			ptmxDeviceExist := false
 			for _, device := range resources.Devices {
 				if device.Type == "c" && device.Major == intptr(1) && device.Minor == intptr(3) {
 					nullDeviceExist = true
@@ -673,6 +867,10 @@ func (s *Sandbox) createResourceController() error {
 
 				if device.Type == "c" && device.Major == intptr(1) && device.Minor == intptr(9) {
 					urandomDeviceExist = true
+				}
+
+				if device.Type == "c" && device.Major == intptr(5) && device.Minor == intptr(2) {
+					ptmxDeviceExist = true
 				}
 			}
 
@@ -687,6 +885,18 @@ func (s *Sandbox) createResourceController() error {
 				resources.Devices = append(resources.Devices, []specs.LinuxDeviceCgroup{
 					{Type: "c", Major: intptr(1), Minor: intptr(9), Access: rwm, Allow: true},
 				}...)
+			}
+
+			// If the hypervisor debug console is enabled and
+			// sandbox_cgroup_only are configured, then the vmm needs access to
+			// /dev/ptmx.  Add this to the device allowlist if it is not
+			// already present in the config.
+			if s.config.HypervisorConfig.Debug && s.config.SandboxCgroupOnly && !ptmxDeviceExist {
+				// "/dev/ptmx"
+				resources.Devices = append(resources.Devices, []specs.LinuxDeviceCgroup{
+					{Type: "c", Major: intptr(5), Minor: intptr(2), Access: rwm, Allow: true},
+				}...)
+
 			}
 
 			if spec.Linux.Resources.CPU != nil {
@@ -846,6 +1056,17 @@ func (s *Sandbox) createNetwork(ctx context.Context) error {
 	if s.config.NetworkConfig.DisableNewNetwork ||
 		s.config.NetworkConfig.NetworkID == "" {
 		return nil
+	}
+
+	// docker container needs the hypervisor process ID to find out the container netns,
+	// which means that the hypervisor has to support network device hotplug so that docker
+	// can use the prestart hooks to set up container netns.
+	caps := s.hypervisor.Capabilities(ctx)
+	if !caps.IsNetworkDeviceHotplugSupported() {
+		spec := s.GetPatchedOCISpec()
+		if utils.IsDockerContainer(spec) {
+			return errors.New("docker container needs network device hotplug but the configured hypervisor does not support it")
+		}
 	}
 
 	span, ctx := katatrace.Trace(ctx, s.Logger(), "createNetwork", sandboxTracingTags, map[string]string{"sandbox_id": s.id})
@@ -1054,12 +1275,15 @@ func (cw *consoleWatcher) start(s *Sandbox) (err error) {
 
 	go func() {
 		for scanner.Scan() {
-			s.Logger().WithFields(logrus.Fields{
-				"console-protocol": cw.proto,
-				"console-url":      cw.consoleURL,
-				"sandbox":          s.id,
-				"vmconsole":        scanner.Text(),
-			}).Debug("reading guest console")
+			text := scanner.Text()
+			if text != "" {
+				s.Logger().WithFields(logrus.Fields{
+					"console-protocol": cw.proto,
+					"console-url":      cw.consoleURL,
+					"sandbox":          s.id,
+					"vmconsole":        text,
+				}).Debug("reading guest console")
+			}
 		}
 
 		if err := scanner.Err(); err != nil {
@@ -1203,6 +1427,22 @@ func (s *Sandbox) cleanSwap(ctx context.Context) {
 	}
 }
 
+func (s *Sandbox) runPrestartHooks(ctx context.Context, prestartHookFunc func(context.Context) error) error {
+	hid, _ := s.GetHypervisorPid()
+	// Ignore errors here as hypervisor might not have been started yet, likely in FC case.
+	if hid > 0 {
+		s.Logger().Infof("sandbox %s hypervisor pid is %v", s.id, hid)
+		ctx = context.WithValue(ctx, HypervisorPidKey{}, hid)
+	}
+
+	if err := prestartHookFunc(ctx); err != nil {
+		s.Logger().Errorf("fail to run prestartHook for sandbox %s: %s", s.id, err)
+		return err
+	}
+
+	return nil
+}
+
 // startVM starts the VM.
 func (s *Sandbox) startVM(ctx context.Context, prestartHookFunc func(context.Context) error) (err error) {
 	span, ctx := katatrace.Trace(ctx, s.Logger(), "startVM", sandboxTracingTags, map[string]string{"sandbox_id": s.id})
@@ -1221,9 +1461,22 @@ func (s *Sandbox) startVM(ctx context.Context, prestartHookFunc func(context.Con
 
 	defer func() {
 		if err != nil {
+			// Log error, otherwise nobody might see it - StopVM could kill this process.
+			s.Logger().WithError(err).Error("Cannot start VM")
 			s.hypervisor.StopVM(ctx, false)
 		}
 	}()
+
+	caps := s.hypervisor.Capabilities(ctx)
+	// If the hypervisor does not support device hotplug, run prestart hooks
+	// before spawning the VM so that it is possible to let the hooks set up
+	// netns and thus network devices are set up statically.
+	if !caps.IsNetworkDeviceHotplugSupported() && prestartHookFunc != nil {
+		err = s.runPrestartHooks(ctx, prestartHookFunc)
+		if err != nil {
+			return err
+		}
+	}
 
 	if err := s.network.Run(ctx, func() error {
 		if s.factory != nil {
@@ -1244,24 +1497,22 @@ func (s *Sandbox) startVM(ctx context.Context, prestartHookFunc func(context.Con
 		return err
 	}
 
-	if prestartHookFunc != nil {
-		hid, err := s.GetHypervisorPid()
+	if caps.IsNetworkDeviceHotplugSupported() && prestartHookFunc != nil {
+		err = s.runPrestartHooks(ctx, prestartHookFunc)
 		if err != nil {
-			return err
-		}
-		s.Logger().Infof("hypervisor pid is %v", hid)
-		ctx = context.WithValue(ctx, HypervisorPidKey{}, hid)
-
-		if err := prestartHookFunc(ctx); err != nil {
 			return err
 		}
 	}
 
-	// 1. Do not scan the netns if we want no network for the vmm.
-	// 2. In case of vm factory, scan the netns to hotplug interfaces after vm is started.
-	// 3. In case of prestartHookFunc, network config might have been changed. We need to
+	// 1. Do not scan the netns if we want no network for the vmm
+	// 2. Do not scan the netns if the vmm does not support device hotplug, in which case
+	//    the network is already set up statically
+	// 3. In case of vm factory, scan the netns to hotplug interfaces after vm is started.
+	// 4. In case of prestartHookFunc, network config might have been changed. We need to
 	//    rescan and handle the change.
-	if !s.config.NetworkConfig.DisableNewNetwork && (s.factory != nil || prestartHookFunc != nil) {
+	if !s.config.NetworkConfig.DisableNewNetwork &&
+		caps.IsNetworkDeviceHotplugSupported() &&
+		(s.factory != nil || prestartHookFunc != nil) {
 		if _, err := s.network.AddEndpoints(ctx, s, nil, true); err != nil {
 			return err
 		}
@@ -1599,12 +1850,14 @@ func (s *Sandbox) Stats(ctx context.Context) (SandboxStats, error) {
 
 	// TODO Do we want to aggregate the overhead cgroup stats to the sandbox ones?
 	switch mt := metrics.(type) {
-	case v1.Metrics:
+	case *v1.Metrics:
 		stats.CgroupStats.CPUStats.CPUUsage.TotalUsage = mt.CPU.Usage.Total
 		stats.CgroupStats.MemoryStats.Usage.Usage = mt.Memory.Usage.Usage
-	case v2.Metrics:
+	case *v2.Metrics:
 		stats.CgroupStats.CPUStats.CPUUsage.TotalUsage = mt.CPU.UsageUsec
 		stats.CgroupStats.MemoryStats.Usage.Usage = mt.Memory.Usage
+	default:
+		return SandboxStats{}, fmt.Errorf("unknown metrics type %T", mt)
 	}
 
 	tids, err := s.hypervisor.GetThreadIDs(ctx)
@@ -1661,7 +1914,6 @@ func (s *Sandbox) createContainers(ctx context.Context) error {
 	defer span.End()
 
 	for i := range s.config.Containers {
-
 		c, err := newContainer(ctx, s, &s.config.Containers[i])
 		if err != nil {
 			return err
@@ -1680,7 +1932,6 @@ func (s *Sandbox) createContainers(ctx context.Context) error {
 	if err := s.updateResources(ctx); err != nil {
 		return err
 	}
-
 	if err := s.resourceControllerUpdate(ctx); err != nil {
 		return err
 	}
@@ -1692,7 +1943,6 @@ func (s *Sandbox) createContainers(ctx context.Context) error {
 	if err := s.storeSandbox(ctx); err != nil {
 		return err
 	}
-
 	return nil
 }
 
@@ -1856,15 +2106,11 @@ func (s *Sandbox) HotplugAddDevice(ctx context.Context, device api.Device, devTy
 		// adding a group of VFIO devices
 		for _, dev := range vfioDevices {
 			if _, err := s.hypervisor.HotplugAddDevice(ctx, dev, VfioDev); err != nil {
-				bdf := ""
-				if pciDevice, ok := (*dev).(config.VFIOPCIDev); ok {
-					bdf = pciDevice.BDF
-				}
 				s.Logger().
 					WithFields(logrus.Fields{
 						"sandbox":         s.id,
-						"vfio-device-ID":  (*dev).GetID(),
-						"vfio-device-BDF": bdf,
+						"vfio-device-ID":  dev.ID,
+						"vfio-device-BDF": dev.BDF,
 					}).WithError(err).Error("failed to hotplug VFIO device")
 				return err
 			}
@@ -1879,6 +2125,7 @@ func (s *Sandbox) HotplugAddDevice(ctx context.Context, device api.Device, devTy
 		return err
 	case config.VhostUserBlk:
 		vhostUserBlkDevice, ok := device.(*drivers.VhostUserBlkDevice)
+
 		if !ok {
 			return fmt.Errorf("device type mismatch, expect device type to be %s", devType)
 		}
@@ -1913,15 +2160,11 @@ func (s *Sandbox) HotplugRemoveDevice(ctx context.Context, device api.Device, de
 		// remove a group of VFIO devices
 		for _, dev := range vfioDevices {
 			if _, err := s.hypervisor.HotplugRemoveDevice(ctx, dev, VfioDev); err != nil {
-				bdf := ""
-				if pciDevice, ok := (*dev).(config.VFIOPCIDev); ok {
-					bdf = pciDevice.BDF
-				}
 				s.Logger().WithError(err).
 					WithFields(logrus.Fields{
 						"sandbox":         s.id,
-						"vfio-device-ID":  (*dev).GetID(),
-						"vfio-device-BDF": bdf,
+						"vfio-device-ID":  dev.ID,
+						"vfio-device-BDF": dev.BDF,
 					}).Error("failed to hot unplug VFIO device")
 				return err
 			}
@@ -1992,26 +2235,49 @@ func (s *Sandbox) AddDevice(ctx context.Context, info config.DeviceInfo) (api.De
 	}
 
 	var err error
-	b, err := s.devManager.NewDevice(info)
+	add, err := s.devManager.NewDevice(info)
 	if err != nil {
 		return nil, err
 	}
 	defer func() {
 		if err != nil {
-			s.devManager.RemoveDevice(b.DeviceID())
+			s.devManager.RemoveDevice(add.DeviceID())
 		}
 	}()
 
-	if err = s.devManager.AttachDevice(ctx, b.DeviceID(), s); err != nil {
+	if err = s.devManager.AttachDevice(ctx, add.DeviceID(), s); err != nil {
 		return nil, err
 	}
 	defer func() {
 		if err != nil {
-			s.devManager.DetachDevice(ctx, b.DeviceID(), s)
+			s.devManager.DetachDevice(ctx, add.DeviceID(), s)
 		}
 	}()
 
-	return b, nil
+	return add, nil
+}
+
+// GetVfioDeviceGuestPciPath return a device's guest PCI path by its host BDF
+func (s *Sandbox) GetVfioDeviceGuestPciPath(hostBDF string) types.PciPath {
+	devices := s.devManager.GetAllDevices()
+	for _, device := range devices {
+		switch device.DeviceType() {
+		case config.DeviceVFIO:
+			vfioDevices, ok := device.GetDeviceInfo().([]*config.VFIODev)
+			if !ok {
+				continue
+			}
+			for _, vfioDev := range vfioDevices {
+				if vfioDev.BDF == hostBDF {
+					return vfioDev.GuestPciPath
+				}
+			}
+		default:
+			continue
+		}
+	}
+
+	return types.PciPath{}
 }
 
 // updateResources will:
@@ -2033,12 +2299,13 @@ func (s *Sandbox) updateResources(ctx context.Context) error {
 		s.Logger().Debug("no resources updated: static resource management is set")
 		return nil
 	}
+
 	sandboxVCPUs, err := s.calculateSandboxCPUs()
 	if err != nil {
 		return err
 	}
 	// Add default vcpus for sandbox
-	sandboxVCPUs += s.hypervisor.HypervisorConfig().NumVCPUs
+	sandboxVCPUs += s.hypervisor.HypervisorConfig().NumVCPUsF
 
 	sandboxMemoryByte, sandboxneedPodSwap, sandboxSwapByte := s.calculateSandboxMemory()
 
@@ -2061,7 +2328,7 @@ func (s *Sandbox) updateResources(ctx context.Context) error {
 
 	// Update VCPUs
 	s.Logger().WithField("cpus-sandbox", sandboxVCPUs).Debugf("Request to hypervisor to update vCPUs")
-	oldCPUs, newCPUs, err := s.hypervisor.ResizeVCPUs(ctx, sandboxVCPUs)
+	oldCPUs, newCPUs, err := s.hypervisor.ResizeVCPUs(ctx, RoundUpNumVCPUs(sandboxVCPUs))
 	if err != nil {
 		return err
 	}
@@ -2069,9 +2336,8 @@ func (s *Sandbox) updateResources(ctx context.Context) error {
 	s.Logger().Debugf("Request to hypervisor to update oldCPUs/newCPUs: %d/%d", oldCPUs, newCPUs)
 	// If the CPUs were increased, ask agent to online them
 	if oldCPUs < newCPUs {
-		vcpusAdded := newCPUs - oldCPUs
-		s.Logger().Debugf("Request to onlineCPUMem with %d CPUs", vcpusAdded)
-		if err := s.agent.onlineCPUMem(ctx, vcpusAdded, true); err != nil {
+		s.Logger().Debugf("Request to onlineCPUMem with %d CPUs", newCPUs)
+		if err := s.agent.onlineCPUMem(ctx, newCPUs, true); err != nil {
 			return err
 		}
 	}
@@ -2258,8 +2524,8 @@ func (s *Sandbox) calculateSandboxMemory() (uint64, bool, int64) {
 	return memorySandbox, needPodSwap, swapSandbox
 }
 
-func (s *Sandbox) calculateSandboxCPUs() (uint32, error) {
-	mCPU := uint32(0)
+func (s *Sandbox) calculateSandboxCPUs() (float32, error) {
+	floatCPU := float32(0)
 	cpusetCount := int(0)
 
 	for _, c := range s.config.Containers {
@@ -2271,7 +2537,7 @@ func (s *Sandbox) calculateSandboxCPUs() (uint32, error) {
 
 		if cpu := c.Resources.CPU; cpu != nil {
 			if cpu.Period != nil && cpu.Quota != nil {
-				mCPU += utils.CalculateMilliCPUs(*cpu.Quota, *cpu.Period)
+				floatCPU += utils.CalculateCPUsF(*cpu.Quota, *cpu.Period)
 			}
 
 			set, err := cpuset.Parse(cpu.Cpus)
@@ -2285,11 +2551,11 @@ func (s *Sandbox) calculateSandboxCPUs() (uint32, error) {
 	// If we aren't being constrained, then we could have two scenarios:
 	//  1. BestEffort QoS: no proper support today in Kata.
 	//  2. We could be constrained only by CPUSets. Check for this:
-	if mCPU == 0 && cpusetCount > 0 {
-		return uint32(cpusetCount), nil
+	if floatCPU == 0 && cpusetCount > 0 {
+		return float32(cpusetCount), nil
 	}
 
-	return utils.CalculateVCpusFromMilliCpus(mCPU), nil
+	return floatCPU, nil
 }
 
 // GetHypervisorType is used for getting Hypervisor name currently used.
@@ -2420,11 +2686,12 @@ func (s *Sandbox) GetPatchedOCISpec() *specs.Spec {
 		return nil
 	}
 
-	// get the container associated with the PodSandbox annotation. In Kubernetes, this
-	// represents the pause container. In Docker, this is the container.
-	// On Linux, we derive the group path from this container.
+	// Get the container associated with the PodSandbox annotation.
+	// In Kubernetes, this represents the pause container.
+	// In CRI-compliant runtimes like Containerd, this is the container.
+	// On Linux, we derive the cgroup path from this container.
 	for _, cConfig := range s.config.Containers {
-		if cConfig.Annotations[annotations.ContainerTypeKey] == string(PodSandbox) {
+		if ContainerType(cConfig.Annotations[annotations.ContainerTypeKey]).IsSandbox() {
 			return cConfig.CustomSpec
 		}
 	}
@@ -2448,6 +2715,11 @@ func (s *Sandbox) GetIPTables(ctx context.Context, isIPv6 bool) ([]byte, error) 
 // SetIPTables will set the iptables in the guest
 func (s *Sandbox) SetIPTables(ctx context.Context, isIPv6 bool, data []byte) error {
 	return s.agent.setIPTables(ctx, isIPv6, data)
+}
+
+// SetPolicy will set the policy in the guest
+func (s *Sandbox) SetPolicy(ctx context.Context, policy string) error {
+	return s.agent.setPolicy(ctx, policy)
 }
 
 // GuestVolumeStats return the filesystem stat of a given volume in the guest.

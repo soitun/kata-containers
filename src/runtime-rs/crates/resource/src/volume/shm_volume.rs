@@ -4,13 +4,16 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-use std::path::Path;
-
-use anyhow::Result;
-use async_trait::async_trait;
+use std::path::{Path, PathBuf};
 
 use super::Volume;
 use crate::share_fs::DEFAULT_KATA_GUEST_SANDBOX_DIR;
+use anyhow::Result;
+use async_trait::async_trait;
+use hypervisor::device::device_manager::DeviceManager;
+use kata_sys_util::mount::{get_mount_path, get_mount_type};
+use oci_spec::runtime as oci;
+use tokio::sync::RwLock;
 
 pub const SHM_DIR: &str = "shm";
 // DEFAULT_SHM_SIZE is the default shm size to be used in case host
@@ -52,21 +55,20 @@ impl ShmVolume {
                 mount_point: mount_path.to_string(),
             };
 
-            // mount
-            let mount = oci::Mount {
-                r#type: "bind".to_string(),
-                destination: m.destination.clone(),
-                source: mount_path.to_string(),
-                options: vec!["rbind".to_string()],
-            };
+            let mut oci_mount = oci::Mount::default();
+            oci_mount.set_destination(m.destination().clone());
+            oci_mount.set_typ(Some("bind".to_string()));
+            oci_mount.set_source(Some(PathBuf::from(&mount_path)));
+            oci_mount.set_options(Some(vec!["rbind".to_string()]));
 
-            (Some(storage), mount)
+            (Some(storage), oci_mount)
         } else {
-            let mount = oci::Mount {
-                r#type: "tmpfs".to_string(),
-                destination: m.destination.clone(),
-                source: "shm".to_string(),
-                options: vec![
+            let mut oci_mount = oci::Mount::default();
+            oci_mount.set_destination(m.destination().clone());
+            oci_mount.set_typ(Some("tmpfs".to_string()));
+            oci_mount.set_source(Some(PathBuf::from("shm")));
+            oci_mount.set_options(Some(
+                [
                     "noexec",
                     "nosuid",
                     "nodev",
@@ -76,8 +78,9 @@ impl ShmVolume {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
-            };
-            (None, mount)
+            ));
+
+            (None, oci_mount)
         };
 
         Ok(Self { storage, mount })
@@ -99,13 +102,18 @@ impl Volume for ShmVolume {
         Ok(s)
     }
 
-    async fn cleanup(&self) -> Result<()> {
+    async fn cleanup(&self, _device_manager: &RwLock<DeviceManager>) -> Result<()> {
         // TODO: Clean up ShmVolume
         warn!(sl!(), "Cleaning up ShmVolume is still unimplemented.");
         Ok(())
     }
+
+    fn get_device_id(&self) -> Result<Option<String>> {
+        Ok(None)
+    }
 }
 
-pub(crate) fn is_shim_volume(m: &oci::Mount) -> bool {
-    m.destination == "/dev/shm" && m.r#type != KATA_EPHEMERAL_DEV_TYPE
+pub(crate) fn is_shm_volume(m: &oci::Mount) -> bool {
+    get_mount_path(&Some(m.destination().clone())).as_str() == "/dev/shm"
+        && get_mount_type(m).as_str() != KATA_EPHEMERAL_DEV_TYPE
 }

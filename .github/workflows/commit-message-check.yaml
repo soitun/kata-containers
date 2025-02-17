@@ -6,6 +6,10 @@ on:
       - reopened
       - synchronize
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 env:
   error_msg: |+
     See the document below for help on formatting commits for the project.
@@ -14,7 +18,9 @@ env:
 
 jobs:
   commit-message-check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
+    env:
+      PR_AUTHOR: ${{ github.event.pull_request.user.login }}
     name: Commit Message Check
     steps:
     - name: Get PR Commits
@@ -28,7 +34,10 @@ jobs:
         #
         # Revert "<original-subject-line>"
         #
-        filter_out_pattern: '^Revert "'
+        # The format of a re-re-vert commit as follows:
+        #
+        # Reapply "<original-subject-line>"
+        filter_out_pattern: '^Revert "|^Reapply "'
 
     - name: DCO Check
       if: ${{ !contains(github.event.pull_request.labels.*.name, 'force-skip-ci') }}
@@ -43,7 +52,7 @@ jobs:
         commits: ${{ steps.get-pr-commits.outputs.commits }}
 
     - name: Check Subject Line Length
-      if: ${{ !contains(github.event.pull_request.labels.*.name, 'force-skip-ci') && ( success() || failure() ) }}
+      if: ${{ (env.PR_AUTHOR != 'dependabot[bot]') && !contains(github.event.pull_request.labels.*.name, 'force-skip-ci') && ( success() || failure() ) }}
       uses: tim-actions/commit-message-checker-with-regex@v0.3.1
       with:
         commits: ${{ steps.get-pr-commits.outputs.commits }}
@@ -52,7 +61,7 @@ jobs:
         post_error: ${{ env.error_msg }}
 
     - name: Check Body Line Length
-      if: ${{ !contains(github.event.pull_request.labels.*.name, 'force-skip-ci') && ( success() || failure() ) }}
+      if: ${{ (env.PR_AUTHOR != 'dependabot[bot]') && !contains(github.event.pull_request.labels.*.name, 'force-skip-ci') && ( success() || failure() ) }}
       uses: tim-actions/commit-message-checker-with-regex@v0.3.1
       with:
         commits: ${{ steps.get-pr-commits.outputs.commits }}
@@ -61,6 +70,9 @@ jobs:
         # - The subject line is not enforced here (see other check), but has
         #   to be specified at the start of the regex as the action is passed
         #   the entire commit message.
+        #
+        # - This check will pass if the commit message only contains a subject
+        #   line, as other body message properties are enforced elsewhere.
         #
         # - Body lines *can* be longer than the maximum if they start
         #   with a non-alphabetic character or if there is no whitespace in
@@ -75,23 +87,12 @@ jobs:
         #
         # - A SoB comment can be any length (as it is unreasonable to penalise
         #   people with long names/email addresses :)
-        pattern: '^.+(\n([a-zA-Z].{0,150}|[^a-zA-Z\n].*|[^\s\n]*|Signed-off-by:.*|))+$'
+        pattern: '(^[^\n]+$|^.+(\n([a-zA-Z].{0,150}|[^a-zA-Z\n].*|[^\s\n]*|Signed-off-by:.*|))+$)'
         error: 'Body line too long (max 150)'
         post_error: ${{ env.error_msg }}
 
-    - name: Check Fixes
-      if: ${{ !contains(github.event.pull_request.labels.*.name, 'force-skip-ci') && ( success() || failure() ) }}
-      uses: tim-actions/commit-message-checker-with-regex@v0.3.1
-      with:
-        commits: ${{ steps.get-pr-commits.outputs.commits }}
-        pattern: '\s*Fixes\s*:?\s*(#\d+|github\.com\/kata-containers\/[a-z-.]*#\d+)|^\s*release\s*:'
-        flags: 'i'
-        error: 'No "Fixes" found'
-        post_error: ${{ env.error_msg }}
-        one_pass_all_pass: 'true'
-
     - name: Check Subsystem
-      if: ${{ !contains(github.event.pull_request.labels.*.name, 'force-skip-ci') && ( success() || failure() ) }}
+      if: ${{ (env.PR_AUTHOR != 'dependabot[bot]') && !contains(github.event.pull_request.labels.*.name, 'force-skip-ci') && ( success() || failure() ) }}
       uses: tim-actions/commit-message-checker-with-regex@v0.3.1
       with:
         commits: ${{ steps.get-pr-commits.outputs.commits }}

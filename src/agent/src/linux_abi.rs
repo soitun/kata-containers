@@ -12,7 +12,7 @@ use std::fs;
 
 pub const SYSFS_DIR: &str = "/sys";
 #[cfg(any(
-    target_arch = "powerpc64",
+    all(target_arch = "powerpc64", target_endian = "little"),
     target_arch = "s390x",
     target_arch = "x86_64",
     target_arch = "x86"
@@ -33,7 +33,7 @@ pub fn create_pci_root_bus_path() -> String {
 
     // check if there is pci bus path for acpi
     acpi_sysfs_dir.push_str(&acpi_root_bus_path);
-    if let Ok(_) = fs::metadata(&acpi_sysfs_dir) {
+    if fs::metadata(&acpi_sysfs_dir).is_ok() {
         return acpi_root_bus_path;
     }
 
@@ -71,6 +71,7 @@ cfg_if! {
         pub const CCW_ROOT_BUS_PATH: &str = "/devices/css0";
         pub const AP_ROOT_BUS_PATH: &str = "/devices/ap";
         pub const AP_SCANS_PATH: &str = "/sys/bus/ap/scans";
+        pub const Z9_CRYPT_DEV_PATH: &str = "/dev/z90crypt";
     }
 }
 
@@ -81,13 +82,15 @@ cfg_if! {
 // sysfs as directories in the subtree under /sys/devices/LNXSYSTM:00
 pub const ACPI_DEV_PATH: &str = "/devices/LNXSYSTM";
 
-pub const SYSFS_CPU_ONLINE_PATH: &str = "/sys/devices/system/cpu";
+pub const SYSFS_CPU_PATH: &str = "/sys/devices/system/cpu";
+pub const SYSFS_CPU_ONLINE_PATH: &str = "/sys/devices/system/cpu/online";
 
 pub const SYSFS_MEMORY_BLOCK_SIZE_PATH: &str = "/sys/devices/system/memory/block_size_bytes";
 pub const SYSFS_MEMORY_HOTPLUG_PROBE_PATH: &str = "/sys/devices/system/memory/probe";
 pub const SYSFS_MEMORY_ONLINE_PATH: &str = "/sys/devices/system/memory";
 
 pub const SYSFS_SCSI_HOST_PATH: &str = "/sys/class/scsi_host";
+pub const SYSFS_NET_PATH: &str = "/sys/class/net";
 
 pub const SYSFS_BUS_PCI_PATH: &str = "/sys/bus/pci";
 

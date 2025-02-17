@@ -2,84 +2,132 @@ name: CI | Run kubernetes tests on AKS
 on:
   workflow_call:
     inputs:
-      image-tag:
+      tarball-suffix:
+        required: false
+        type: string
+      registry:
         required: true
         type: string
+      repo:
+        required: true
+        type: string
+      tag:
+        required: true
+        type: string
+      pr-number:
+        required: true
+        type: string
+      commit-hash:
+        required: false
+        type: string
+      target-branch:
+        required: false
+        type: string
+        default: ""
 
 jobs:
-  create-aks:
-    strategy:
-      matrix:
-        vmm:
-          - clh
-          - qemu
-    uses: ./.github/workflows/create-aks.yaml
-    with:
-      name: ${{ github.event.pull_request.number }}-${{ github.sha }}-${{ matrix.vmm }}-amd64
-    secrets: inherit
-
   run-k8s-tests:
     strategy:
       fail-fast: false
       matrix:
+        host_os:
+          - ubuntu
         vmm:
           - clh
+          - dragonball
           - qemu
-    runs-on: ubuntu-latest
-    needs: create-aks
+          - qemu-runtime-rs
+          - stratovirt
+          - cloud-hypervisor
+        instance-type:
+          - small
+          - normal
+        include:
+          - host_os: cbl-mariner
+            vmm: clh
+            instance-type: small
+            genpolicy-pull-method: oci-distribution
+            auto-generate-policy: yes
+          - host_os: cbl-mariner
+            vmm: clh
+            instance-type: small
+            genpolicy-pull-method: containerd
+            auto-generate-policy: yes
+          - host_os: cbl-mariner
+            vmm: clh
+            instance-type: normal
+            auto-generate-policy: yes
+    runs-on: ubuntu-22.04
+    env:
+      DOCKER_REGISTRY: ${{ inputs.registry }}
+      DOCKER_REPO: ${{ inputs.repo }}
+      DOCKER_TAG: ${{ inputs.tag }}
+      GH_PR_NUMBER: ${{ inputs.pr-number }}
+      KATA_HOST_OS: ${{ matrix.host_os }}
+      KATA_HYPERVISOR: ${{ matrix.vmm }}
+      KUBERNETES: "vanilla"
+      USING_NFD: "false"
+      K8S_TEST_HOST_TYPE: ${{ matrix.instance-type }}
+      GENPOLICY_PULL_METHOD: ${{ matrix.genpolicy-pull-method }}
+      AUTO_GENERATE_POLICY: ${{ matrix.auto-generate-policy }}
     steps:
-      - uses: actions/checkout@v3
-      - name: Install `bats`
-        run: |
-          sudo apt-get update
-          sudo apt-get -y install bats
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit-hash }}
+          fetch-depth: 0
 
-      - name: Install `kubectl`
+      - name: Rebase atop of the latest target branch
         run: |
-          sudo az aks install-cli
+          ./tests/git-helper.sh "rebase-atop-of-the-latest-target-branch"
+        env:
+          TARGET_BRANCH: ${{ inputs.target-branch }}
+
+      - name: get-kata-tarball
+        uses: actions/download-artifact@v4
+        with:
+          name: kata-static-tarball-amd64${{ inputs.tarball-suffix }}
+          path: kata-artifacts
+
+      - name: Install kata
+        run: bash tests/integration/kubernetes/gha-run.sh install-kata-tools kata-artifacts
+
+      - name: Download Azure CLI
+        run: bash tests/integration/kubernetes/gha-run.sh install-azure-cli
 
       - name: Log into the Azure account
-        run: |
-          az login \
-            --service-principal \
-            -u "${{ secrets.AZ_APPID }}" \
-            -p "${{ secrets.AZ_PASSWORD }}" \
-            --tenant "${{ secrets.AZ_TENANT_ID }}"
+        run: bash tests/integration/kubernetes/gha-run.sh login-azure
+        env:
+          AZ_APPID: ${{ secrets.AZ_APPID }}
+          AZ_PASSWORD: ${{ secrets.AZ_PASSWORD }}
+          AZ_TENANT_ID: ${{ secrets.AZ_TENANT_ID }}
+          AZ_SUBSCRIPTION_ID: ${{ secrets.AZ_SUBSCRIPTION_ID }}
+
+      - name: Create AKS cluster
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 15
+          max_attempts: 20
+          retry_on: error
+          retry_wait_seconds: 10
+          command: bash tests/integration/kubernetes/gha-run.sh create-cluster
+
+      - name: Install `bats`
+        run: bash tests/integration/kubernetes/gha-run.sh install-bats
+
+      - name: Install `kubectl`
+        run: bash tests/integration/kubernetes/gha-run.sh install-kubectl
 
       - name: Download credentials for the Kubernetes CLI to use them
-        run: |
-          az aks get-credentials -g "kataCI" -n ${{ github.event.pull_request.number }}-${{ github.sha }}-${{ matrix.vmm }}-amd64
+        run: bash tests/integration/kubernetes/gha-run.sh get-cluster-credentials
 
-      - name: Deploy kata-deploy
-        run: |
-          sed -i -e "s|quay.io/kata-containers/kata-deploy:latest|quay.io/kata-containers/kata-deploy-ci:${{ inputs.image-tag }}|g" tools/packaging/kata-deploy/kata-deploy/base/kata-deploy.yaml
-          cat tools/packaging/kata-deploy/kata-deploy/base/kata-deploy.yaml
-          cat tools/packaging/kata-deploy/kata-deploy/base/kata-deploy.yaml | grep "quay.io/kata-containers/kata-deploy-ci:${{ inputs.image-tag }}" || die "Failed to setup the tests image"
-
-          kubectl apply -f tools/packaging/kata-deploy/kata-rbac/base/kata-rbac.yaml
-          kubectl apply -f tools/packaging/kata-deploy/kata-deploy/base/kata-deploy.yaml
-          kubectl -n kube-system wait --timeout=10m --for=condition=Ready -l name=kata-deploy pod
-          kubectl apply -f tools/packaging/kata-deploy/runtimeclasses/kata-runtimeClasses.yaml
+      - name: Deploy Kata
+        timeout-minutes: 10
+        run: bash tests/integration/kubernetes/gha-run.sh deploy-kata-aks
 
       - name: Run tests
-        timeout-minutes: 30
-        run: |
-          pushd tests/integration/kubernetes
-          sed -i -e 's|runtimeClassName: kata|runtimeClassName: kata-${{ matrix.vmm }}|' runtimeclass_workloads/*.yaml
-          bash run_kubernetes_tests.sh
-          popd
-        env:
-          KATA_HYPERVISOR: ${{ matrix.vmm }}
+        timeout-minutes: 60
+        run: bash tests/integration/kubernetes/gha-run.sh run-tests
 
-  delete-aks:
-    strategy:
-      matrix:
-        vmm:
-          - clh
-          - qemu
-    needs: run-k8s-tests
-    if: always()
-    uses: ./.github/workflows/delete-aks.yaml
-    with:
-      name: ${{ github.event.pull_request.number }}-${{ github.sha }}-${{ matrix.vmm }}-amd64
-    secrets: inherit
+      - name: Delete AKS cluster
+        if: always()
+        run: bash tests/integration/kubernetes/gha-run.sh delete-cluster

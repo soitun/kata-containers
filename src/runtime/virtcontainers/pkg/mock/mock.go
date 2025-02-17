@@ -16,9 +16,9 @@ import (
 	"strings"
 
 	"github.com/containerd/ttrpc"
-	gpb "github.com/gogo/protobuf/types"
 	aTypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/agent/protocols"
 	pb "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/agent/protocols/grpc"
+	gpb "google.golang.org/protobuf/types/known/emptypb"
 )
 
 const VSockPrefix = "mock://"
@@ -245,10 +245,18 @@ func (p *HybridVSockTTRPCMockImp) ResizeVolume(ctx context.Context, req *pb.Resi
 	return &gpb.Empty{}, nil
 }
 
+func (p *HybridVSockTTRPCMockImp) RemoveStaleVirtiofsShareMounts(ctx context.Context, req *pb.RemoveStaleVirtiofsShareMountsRequest) (*gpb.Empty, error) {
+	return &gpb.Empty{}, nil
+}
+
 func (p *HybridVSockTTRPCMockImp) GetIPTables(ctx context.Context, req *pb.GetIPTablesRequest) (*pb.GetIPTablesResponse, error) {
 	return &pb.GetIPTablesResponse{}, nil
 }
 
 func (p *HybridVSockTTRPCMockImp) SetIPTables(ctx context.Context, req *pb.SetIPTablesRequest) (*pb.SetIPTablesResponse, error) {
 	return &pb.SetIPTablesResponse{}, nil
+}
+
+func (p *HybridVSockTTRPCMockImp) SetPolicy(ctx context.Context, req *pb.SetPolicyRequest) (*gpb.Empty, error) {
+	return &gpb.Empty{}, nil
 }

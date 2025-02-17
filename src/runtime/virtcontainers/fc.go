@@ -306,8 +306,7 @@ func (fc *firecracker) parseVersion(data string) (string, error) {
 	var version string
 	fields := strings.Split(lines[0], " ")
 	if len(fields) > 1 {
-		// The output format of `Firecracker --version` is as follows
-		// Firecracker v0.23.1
+		// The output format of `Firecracker --version` is as follows.
 		version = strings.TrimPrefix(strings.TrimSpace(fields[1]), "v")
 		return version, nil
 	}
@@ -693,7 +692,7 @@ func (fc *firecracker) fcInitConfiguration(ctx context.Context) error {
 	}
 
 	fc.fcSetVMBaseConfig(ctx, int64(fc.config.MemorySize),
-		int64(fc.config.NumVCPUs), false)
+		int64(fc.config.NumVCPUs()), false)
 
 	kernelPath, err := fc.config.KernelAssetPath()
 	if err != nil {
@@ -722,19 +721,12 @@ func (fc *firecracker) fcInitConfiguration(ctx context.Context) error {
 		return err
 	}
 
-	image, err := fc.config.InitrdAssetPath()
+	assetPath, _, err := fc.config.ImageOrInitrdAssetPath()
 	if err != nil {
 		return err
 	}
 
-	if image == "" {
-		image, err = fc.config.ImageAssetPath()
-		if err != nil {
-			return err
-		}
-	}
-
-	if err := fc.fcSetVMRootfs(ctx, image); err != nil {
+	if err := fc.fcSetVMRootfs(ctx, assetPath); err != nil {
 		return err
 	}
 
@@ -841,6 +833,17 @@ func (fc *firecracker) createDiskPool(ctx context.Context) error {
 			IsReadOnly:   &isReadOnly,
 			IsRootDevice: &isRootDevice,
 			PathOnHost:   &jailedDrive,
+		}
+
+		if fc.config.BlockDeviceCacheSet {
+			var cacheOption string
+			if fc.config.BlockDeviceCacheNoflush {
+				cacheOption = models.DriveCacheTypeUnsafe
+			} else {
+				cacheOption = models.DriveCacheTypeWriteback
+			}
+
+			drive.CacheType = &cacheOption
 		}
 
 		fc.fcConfig.Drives = append(fc.fcConfig.Drives, drive)

@@ -53,12 +53,14 @@ use std::time::Instant;
 use lazy_static::lazy_static;
 use nix::mount::{mount, MntFlags, MsFlags};
 use nix::{unistd, NixPath};
+use oci_spec::runtime as oci;
 
 use crate::fs::is_symlink;
 use crate::sl;
 
 /// Default permission for directories created for mountpoint.
-const MOUNT_PERM: u32 = 0o755;
+const MOUNT_DIR_PERM: u32 = 0o755;
+const MOUNT_FILE_PERM: u32 = 0o644;
 
 pub const PROC_MOUNTS_FILE: &str = "/proc/mounts";
 const PROC_FIELDS_PER_LINE: usize = 6;
@@ -103,6 +105,8 @@ pub enum Error {
     MountOptionTooBig,
     #[error("Path for mountpoint is null")]
     NullMountPointPath,
+    #[error("Invalid Propagation type Flag")]
+    InvalidPgMountFlag,
     #[error("Faile to open file {0} by path, {1}")]
     OpenByPath(PathBuf, io::Error),
     #[error("Can not read metadata of {0}, {1}")]
@@ -131,9 +135,10 @@ pub struct LinuxMountInfo {
 /// Get the device and file system type of a mount point by parsing `/proc/mounts`.
 pub fn get_linux_mount_info(mount_point: &str) -> Result<LinuxMountInfo> {
     let mount_file = fs::File::open(PROC_MOUNTS_FILE)?;
-    let lines = io::BufReader::new(mount_file).lines();
+    let reader = io::BufReader::new(mount_file);
 
-    for mount in lines.flatten() {
+    for line in reader.lines() {
+        let mount = line?;
         let fields: Vec<&str> = mount.split(' ').collect();
 
         if fields.len() != PROC_FIELDS_PER_LINE {
@@ -185,13 +190,16 @@ pub fn create_mount_destination<S: AsRef<Path>, D: AsRef<Path>, R: AsRef<Path>>(
         .parent()
         .ok_or_else(|| Error::InvalidPath(dst.to_path_buf()))?;
     let mut builder = fs::DirBuilder::new();
-    builder.mode(MOUNT_PERM).recursive(true).create(parent)?;
+    builder
+        .mode(MOUNT_DIR_PERM)
+        .recursive(true)
+        .create(parent)?;
 
     if fs_type == "bind" {
         // The source and destination for bind mounting must be the same type: file or directory.
         if !src.as_ref().is_dir() {
             fs::OpenOptions::new()
-                .mode(MOUNT_PERM)
+                .mode(MOUNT_FILE_PERM)
                 .write(true)
                 .create(true)
                 .open(dst)?;
@@ -227,7 +235,13 @@ pub fn bind_remount<P: AsRef<Path>>(dst: P, readonly: bool) -> Result<()> {
     do_rebind_mount(dst, readonly, MsFlags::empty())
 }
 
-/// Bind mount `src` to `dst` in slave mode, optionally in readonly mode if `readonly` is true.
+/// Bind mount `src` to `dst` with a custom propagation type, optionally in readonly mode if
+/// `readonly` is true.
+///
+/// Propagation type: MsFlags::MS_SHARED or MsFlags::MS_SLAVE
+/// MsFlags::MS_SHARED is used to bind mount the sandbox path to enable `exec` (in case of FC
+/// jailer).
+/// MsFlags::MS_SLAVE is used on all other cases.
 ///
 /// # Safety
 /// Caller needs to ensure:
@@ -238,6 +252,7 @@ pub fn bind_mount_unchecked<S: AsRef<Path>, D: AsRef<Path>>(
     src: S,
     dst: D,
     readonly: bool,
+    pgflag: MsFlags,
 ) -> Result<()> {
     fail::fail_point!("bind_mount", |_| {
         Err(Error::FailureInject(
@@ -268,8 +283,11 @@ pub fn bind_mount_unchecked<S: AsRef<Path>, D: AsRef<Path>>(
     )
     .map_err(|e| Error::BindMount(abs_src, dst.to_path_buf(), e))?;
 
-    // Change into slave propagation mode.
-    mount(Some(""), dst, Some(""), MsFlags::MS_SLAVE, Some(""))
+    // Change into the chosen propagation mode.
+    if !(pgflag == MsFlags::MS_SHARED || pgflag == MsFlags::MS_SLAVE) {
+        return Err(Error::InvalidPgMountFlag);
+    }
+    mount(Some(""), dst, Some(""), pgflag, Some(""))
         .map_err(|e| Error::Mount(PathBuf::new(), dst.to_path_buf(), e))?;
 
     // Optionally rebind into readonly mode.
@@ -378,19 +396,17 @@ fn do_rebind_mount<P: AsRef<Path>>(path: P, readonly: bool, flags: MsFlags) -> R
 }
 
 /// Take fstab style mount options and parses them for use with a standard mount() syscall.
-fn parse_mount_options(options: &[String]) -> Result<(MsFlags, String)> {
+pub fn parse_mount_options<T: AsRef<str>>(options: &[T]) -> Result<(MsFlags, String)> {
     let mut flags: MsFlags = MsFlags::empty();
     let mut data: Vec<String> = Vec::new();
 
     for opt in options.iter() {
-        if opt == "defaults" {
-            continue;
-        } else if opt == "loop" {
+        if opt.as_ref() == "loop" {
             return Err(Error::InvalidMountOption("loop".to_string()));
-        } else if let Some(v) = parse_mount_flags(flags, opt) {
+        } else if let Some(v) = parse_mount_flags(flags, opt.as_ref()) {
             flags = v;
         } else {
-            data.push(opt.clone());
+            data.push(opt.as_ref().to_string());
         }
     }
 
@@ -429,6 +445,7 @@ fn parse_mount_flags(mut flags: MsFlags, flag_str: &str) -> Option<MsFlags> {
     //   overridden by subsequent options, as in the option line users,exec,dev,suid).
     match flag_str {
         // Clear flags
+        "defaults" => {}
         "async" => flags &= !MsFlags::MS_SYNCHRONOUS,
         "atime" => flags &= !MsFlags::MS_NOATIME,
         "dev" => flags &= !MsFlags::MS_NODEV,
@@ -452,6 +469,14 @@ fn parse_mount_flags(mut flags: MsFlags, flag_str: &str) -> Option<MsFlags> {
         "noexec" => flags |= MsFlags::MS_NOEXEC,
         "nosuid" => flags |= MsFlags::MS_NOSUID,
         "rbind" => flags |= MsFlags::MS_BIND | MsFlags::MS_REC,
+        "unbindable" => flags |= MsFlags::MS_UNBINDABLE,
+        "runbindable" => flags |= MsFlags::MS_UNBINDABLE | MsFlags::MS_REC,
+        "private" => flags |= MsFlags::MS_PRIVATE,
+        "rprivate" => flags |= MsFlags::MS_PRIVATE | MsFlags::MS_REC,
+        "shared" => flags |= MsFlags::MS_SHARED,
+        "rshared" => flags |= MsFlags::MS_SHARED | MsFlags::MS_REC,
+        "slave" => flags |= MsFlags::MS_SLAVE,
+        "rslave" => flags |= MsFlags::MS_SLAVE | MsFlags::MS_REC,
         "relatime" => flags |= MsFlags::MS_RELATIME,
         "remount" => flags |= MsFlags::MS_REMOUNT,
         "ro" => flags |= MsFlags::MS_RDONLY,
@@ -592,7 +617,6 @@ fn compact_lowerdir_option(opts: &[String]) -> (Option<PathBuf>, Vec<String>) {
         }
     };
 
-    let idx = idx;
     let common_dir = match get_longest_common_prefix(&lower_opts) {
         None => return (None, n_opts),
         Some(v) => {
@@ -765,6 +789,33 @@ fn umount2<P: AsRef<Path>>(path: P, lazy_umount: bool) -> std::io::Result<()> {
     nix::mount::umount2(path.as_ref(), flags).map_err(io::Error::from)
 }
 
+pub fn get_mount_path(p: &Option<PathBuf>) -> String {
+    p.clone().unwrap_or_default().display().to_string()
+}
+
+pub fn get_mount_options(options: &Option<Vec<String>>) -> Vec<String> {
+    match options {
+        Some(o) => o.to_vec(),
+        None => vec![],
+    }
+}
+
+pub fn get_mount_type(m: &oci::Mount) -> String {
+    m.typ()
+        .clone()
+        .map(|typ| {
+            if typ.as_str() == "none" {
+                if let Some(opts) = m.options() {
+                    if opts.iter().any(|opt| opt == "bind" || opt == "rbind") {
+                        return "bind".to_string();
+                    }
+                }
+            }
+            typ
+        })
+        .unwrap_or("bind".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -828,7 +879,7 @@ mod tests {
             Err(Error::InvalidPath(_))
         ));
 
-        bind_mount_unchecked(tmpdir2.path(), tmpdir.path(), true).unwrap();
+        bind_mount_unchecked(tmpdir2.path(), tmpdir.path(), true, MsFlags::MS_SLAVE).unwrap();
         bind_remount(tmpdir.path(), true).unwrap();
         umount_timeout(tmpdir.path().to_str().unwrap(), 0).unwrap();
     }
@@ -844,25 +895,26 @@ mod tests {
         dst.push("src");
 
         assert!(matches!(
-            bind_mount_unchecked(Path::new(""), Path::new(""), false),
+            bind_mount_unchecked(Path::new(""), Path::new(""), false, MsFlags::MS_SLAVE),
             Err(Error::NullMountPointPath)
         ));
         assert!(matches!(
-            bind_mount_unchecked(tmpdir2.path(), Path::new(""), false),
+            bind_mount_unchecked(tmpdir2.path(), Path::new(""), false, MsFlags::MS_SLAVE),
             Err(Error::NullMountPointPath)
         ));
         assert!(matches!(
             bind_mount_unchecked(
                 Path::new("/_does_not_exist_/___aahhhh"),
                 Path::new("/tmp/_does_not_exist/___bbb"),
-                false
+                false,
+                MsFlags::MS_SLAVE
             ),
             Err(Error::InvalidPath(_))
         ));
 
         let dst = create_mount_destination(tmpdir2.path(), &dst, tmpdir.path(), "bind").unwrap();
-        bind_mount_unchecked(tmpdir2.path(), dst.as_ref(), true).unwrap();
-        bind_mount_unchecked(&src, dst.as_ref(), false).unwrap();
+        bind_mount_unchecked(tmpdir2.path(), dst.as_ref(), true, MsFlags::MS_SLAVE).unwrap();
+        bind_mount_unchecked(&src, dst.as_ref(), false, MsFlags::MS_SLAVE).unwrap();
         umount_all(dst.as_ref(), false).unwrap();
 
         let mut src = tmpdir.path().to_owned();
@@ -871,7 +923,7 @@ mod tests {
         let mut dst = tmpdir.path().to_owned();
         dst.push("file");
         let dst = create_mount_destination(&src, &dst, tmpdir.path(), "bind").unwrap();
-        bind_mount_unchecked(&src, dst.as_ref(), false).unwrap();
+        bind_mount_unchecked(&src, dst.as_ref(), false, MsFlags::MS_SLAVE).unwrap();
         assert!(dst.as_ref().is_file());
         umount_timeout(dst.as_ref(), 0).unwrap();
     }
@@ -1017,7 +1069,7 @@ mod tests {
 
     #[test]
     fn test_parse_mount_options() {
-        let options = vec![];
+        let options: Vec<&str> = vec![];
         let (flags, data) = parse_mount_options(&options).unwrap();
         assert!(flags.is_empty());
         assert!(data.is_empty());

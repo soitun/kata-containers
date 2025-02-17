@@ -25,14 +25,17 @@ pub mod hypervisor;
 pub use self::agent::Agent;
 use self::default::DEFAULT_AGENT_DBG_CONSOLE_PORT;
 pub use self::hypervisor::{
-    BootInfo, CloudHypervisorConfig, DragonballConfig, Hypervisor, QemuConfig,
-    HYPERVISOR_NAME_DRAGONBALL, HYPERVISOR_NAME_QEMU,
+    BootInfo, CloudHypervisorConfig, DragonballConfig, FirecrackerConfig, Hypervisor, QemuConfig,
+    RemoteConfig, HYPERVISOR_NAME_DRAGONBALL, HYPERVISOR_NAME_FIRECRACKER, HYPERVISOR_NAME_QEMU,
 };
 
 mod runtime;
 pub use self::runtime::{Runtime, RuntimeVendor, RUNTIME_NAME_VIRTCONTAINER};
 
 pub use self::agent::AGENT_NAME_KATA;
+
+/// kata run dir
+pub const KATA_PATH: &str = "/run/kata";
 
 // TODO: let agent use the constants here for consistency
 /// Debug console enabled flag for agent
@@ -51,6 +54,8 @@ pub const DEBUG_CONSOLE_VPORT_OPTION: &str = "agent.debug_console_vport";
 pub const LOG_VPORT_OPTION: &str = "agent.log_vport";
 /// Option of setting the container's pipe size
 pub const CONTAINER_PIPE_SIZE_OPTION: &str = "agent.container_pipe_size";
+/// Option of setting the fd passthrough io listener port
+pub const PASSFD_LISTENER_PORT: &str = "agent.passfd_listener_port";
 
 /// Trait to manipulate global Kata configuration information.
 pub trait ConfigPlugin: Send + Sync {
@@ -110,6 +115,14 @@ pub struct TomlConfig {
     pub runtime: Runtime,
 }
 
+macro_rules! mem_agent_kv_insert {
+    ($ma_cfg:expr, $key:expr, $map:expr) => {
+        if let Some(n) = $ma_cfg {
+            $map.insert($key.to_string(), n.to_string());
+        }
+    };
+}
+
 impl TomlConfig {
     /// Load Kata configuration information from configuration files.
     ///
@@ -125,6 +138,14 @@ impl TomlConfig {
         }
 
         result
+    }
+
+    /// Load raw Kata configuration information from default configuration file.
+    ///
+    /// Configuration file is probed according to the default configuration file list
+    /// default::DEFAULT_RUNTIME_CONFIGURATIONS.
+    pub fn load_from_default() -> Result<(TomlConfig, PathBuf)> {
+        Self::load_raw_from_file("")
     }
 
     /// Load raw Kata configuration information from configuration files.
@@ -191,12 +212,89 @@ impl TomlConfig {
                     DEFAULT_AGENT_DBG_CONSOLE_PORT.to_string(),
                 );
             }
+            if cfg.mem_agent.enable {
+                kv.insert("psi".to_string(), "1".to_string());
+                kv.insert("agent.mem_agent_enable".to_string(), "1".to_string());
+
+                mem_agent_kv_insert!(
+                    cfg.mem_agent.memcg_disable,
+                    "agent.mem_agent_memcg_disable",
+                    kv
+                );
+                mem_agent_kv_insert!(cfg.mem_agent.memcg_swap, "agent.mem_agent_memcg_swap", kv);
+                mem_agent_kv_insert!(
+                    cfg.mem_agent.memcg_swappiness_max,
+                    "agent.mem_agent_memcg_swappiness_max",
+                    kv
+                );
+                mem_agent_kv_insert!(
+                    cfg.mem_agent.memcg_period_secs,
+                    "agent.mem_agent_memcg_period_secs",
+                    kv
+                );
+                mem_agent_kv_insert!(
+                    cfg.mem_agent.memcg_period_psi_percent_limit,
+                    "agent.mem_agent_memcg_period_psi_percent_limit",
+                    kv
+                );
+                mem_agent_kv_insert!(
+                    cfg.mem_agent.memcg_eviction_psi_percent_limit,
+                    "agent.mem_agent_memcg_eviction_psi_percent_limit",
+                    kv
+                );
+                mem_agent_kv_insert!(
+                    cfg.mem_agent.memcg_eviction_run_aging_count_min,
+                    "agent.mem_agent_memcg_eviction_run_aging_count_min",
+                    kv
+                );
+
+                mem_agent_kv_insert!(
+                    cfg.mem_agent.compact_disable,
+                    "agent.mem_agent_compact_disable",
+                    kv
+                );
+                mem_agent_kv_insert!(
+                    cfg.mem_agent.compact_period_secs,
+                    "agent.mem_agent_compact_period_secs",
+                    kv
+                );
+                mem_agent_kv_insert!(
+                    cfg.mem_agent.compact_period_psi_percent_limit,
+                    "agent.mem_agent_compact_period_psi_percent_limit",
+                    kv
+                );
+                mem_agent_kv_insert!(
+                    cfg.mem_agent.compact_psi_percent_limit,
+                    "agent.mem_agent_compact_psi_percent_limit",
+                    kv
+                );
+                mem_agent_kv_insert!(
+                    cfg.mem_agent.compact_sec_max,
+                    "agent.mem_agent_compact_sec_max",
+                    kv
+                );
+                mem_agent_kv_insert!(
+                    cfg.mem_agent.compact_order,
+                    "agent.mem_agent_compact_order",
+                    kv
+                );
+                mem_agent_kv_insert!(
+                    cfg.mem_agent.compact_threshold,
+                    "agent.mem_agent_compact_threshold",
+                    kv
+                );
+                mem_agent_kv_insert!(
+                    cfg.mem_agent.compact_force_times,
+                    "agent.mem_agent_compact_force_times",
+                    kv
+                );
+            }
         }
         Ok(kv)
     }
 
     /// Probe configuration file according to the default configuration file list.
-    fn get_default_config_file() -> Result<PathBuf> {
+    pub fn get_default_config_file() -> Result<PathBuf> {
         for f in default::DEFAULT_RUNTIME_CONFIGURATIONS.iter() {
             if let Ok(path) = fs::canonicalize(f) {
                 return Ok(path);
@@ -204,6 +302,14 @@ impl TomlConfig {
         }
 
         Err(io::Error::from(io::ErrorKind::NotFound))
+    }
+
+    /// Return a list of default config file paths.
+    pub fn get_default_config_file_list() -> Vec<PathBuf> {
+        default::DEFAULT_RUNTIME_CONFIGURATIONS
+            .iter()
+            .map(|s| PathBuf::from(*s))
+            .collect()
     }
 }
 

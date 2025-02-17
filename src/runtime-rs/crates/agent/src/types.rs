@@ -9,6 +9,8 @@ use std::convert::TryFrom;
 
 use serde::{Deserialize, Serialize};
 
+use oci_spec::runtime as oci;
+
 pub const DEFAULT_REMOVE_CONTAINER_REQUEST_TIMEOUT: u32 = 10;
 
 #[derive(PartialEq, Clone, Default)]
@@ -20,14 +22,9 @@ impl Empty {
     }
 }
 
-impl Default for FSGroupChangePolicy {
-    fn default() -> Self {
-        FSGroupChangePolicy::Always
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Default, Debug, Clone, PartialEq)]
 pub enum FSGroupChangePolicy {
+    #[default]
     Always = 0,
     OnRootMismatch = 1,
 }
@@ -45,7 +42,7 @@ pub struct StringUser {
     pub additional_gids: Vec<String>,
 }
 
-#[derive(PartialEq, Clone, Default)]
+#[derive(PartialEq, Clone, Debug, Default)]
 pub struct Device {
     pub id: String,
     pub field_type: String,
@@ -65,16 +62,20 @@ pub struct Storage {
     pub mount_point: String,
 }
 
-#[derive(Deserialize, Clone, PartialEq, Eq, Debug, Hash)]
-pub enum IPFamily {
-    V4 = 0,
-    V6 = 1,
+#[derive(PartialEq, Clone, Default)]
+pub struct SharedMount {
+    pub name: String,
+    pub src_ctr: String,
+    pub src_path: String,
+    pub dst_ctr: String,
+    pub dst_path: String,
 }
 
-impl ::std::default::Default for IPFamily {
-    fn default() -> Self {
-        IPFamily::V4
-    }
+#[derive(Deserialize, Default, Clone, PartialEq, Eq, Debug, Hash)]
+pub enum IPFamily {
+    #[default]
+    V4 = 0,
+    V6 = 1,
 }
 
 #[derive(Deserialize, Debug, PartialEq, Clone, Default)]
@@ -128,6 +129,10 @@ pub struct CreateContainerRequest {
     pub oci: Option<oci::Spec>,
     pub sandbox_pidns: bool,
     pub rootfs_mounts: Vec<oci::Mount>,
+    pub shared_mounts: Vec<SharedMount>,
+    pub stdin_port: Option<u32>,
+    pub stdout_port: Option<u32>,
+    pub stderr_port: Option<u32>,
 }
 
 #[derive(PartialEq, Clone, Default)]
@@ -211,7 +216,7 @@ pub struct ListProcessesRequest {
 #[derive(PartialEq, Clone, Default)]
 pub struct UpdateContainerRequest {
     pub container_id: String,
-    pub resources: oci::LinuxResources,
+    pub resources: Option<oci::LinuxResources>,
     pub mounts: Vec<oci::Mount>,
 }
 
@@ -252,6 +257,9 @@ pub struct ExecProcessRequest {
     pub process_id: ContainerProcessID,
     pub string_user: Option<StringUser>,
     pub process: Option<oci::Process>,
+    pub stdin_port: Option<u32>,
+    pub stdout_port: Option<u32>,
+    pub stderr_port: Option<u32>,
 }
 
 #[derive(PartialEq, Clone, Default, Debug)]
@@ -521,6 +529,7 @@ pub struct AgentDetails {
     pub device_handlers: Vec<String>,
     pub storage_handlers: Vec<std::string::String>,
     pub supports_seccomp: bool,
+    pub extra_features: Vec<std::string::String>,
 }
 
 #[derive(PartialEq, Clone, Default)]
@@ -564,6 +573,11 @@ pub struct HealthCheckResponse {
 pub struct VersionCheckResponse {
     pub grpc_version: String,
     pub agent_version: String,
+}
+
+#[derive(PartialEq, Clone, Default, Debug)]
+pub struct MetricsResponse {
+    pub metrics: String,
 }
 
 #[derive(PartialEq, Clone, Default, Debug)]

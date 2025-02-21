@@ -3,31 +3,24 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-use crate::types::{Config, Options};
+use crate::image;
+use crate::types::*;
 use anyhow::{anyhow, Result};
-use oci::{
-    Linux as ociLinux, Mount as ociMount, Process as ociProcess, Root as ociRoot, Spec as ociSpec,
-};
+use oci::{Root as ociRoot, Spec as ociSpec};
+use oci_spec::runtime as oci;
+use protocols::agent::{CopyFileRequest, CreateContainerRequest, SetPolicyRequest};
 use protocols::oci::{
-    Box as ttrpcBox, Linux as ttrpcLinux, LinuxBlockIO as ttrpcLinuxBlockIO,
-    LinuxCPU as ttrpcLinuxCPU, LinuxCapabilities as ttrpcLinuxCapabilities,
-    LinuxDevice as ttrpcLinuxDevice, LinuxDeviceCgroup as ttrpcLinuxDeviceCgroup,
-    LinuxHugepageLimit as ttrpcLinuxHugepageLimit, LinuxIDMapping as ttrpcLinuxIDMapping,
-    LinuxIntelRdt as ttrpcLinuxIntelRdt, LinuxInterfacePriority as ttrpcLinuxInterfacePriority,
-    LinuxMemory as ttrpcLinuxMemory, LinuxNamespace as ttrpcLinuxNamespace,
-    LinuxNetwork as ttrpcLinuxNetwork, LinuxPids as ttrpcLinuxPids,
-    LinuxResources as ttrpcLinuxResources, LinuxSeccomp as ttrpcLinuxSeccomp,
-    LinuxSeccompArg as ttrpcLinuxSeccompArg, LinuxSyscall as ttrpcLinuxSyscall,
-    LinuxThrottleDevice as ttrpcLinuxThrottleDevice, LinuxWeightDevice as ttrpcLinuxWeightDevice,
     Mount as ttrpcMount, Process as ttrpcProcess, Root as ttrpcRoot, Spec as ttrpcSpec,
-    User as ttrpcUser,
 };
 use rand::Rng;
+use safe_path::scoped_join;
 use serde::de::DeserializeOwned;
 use slog::{debug, warn};
 use std::collections::HashMap;
-use std::fs::File;
-use std::path::PathBuf;
+use std::fs::{self, File};
+use std::io::Read;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 // Length of a sandbox identifier
@@ -40,6 +33,10 @@ const MIN_HOSTNAME_LEN: u8 = 8;
 
 // Name of the OCI configuration file found at the root of an OCI bundle.
 const CONFIG_FILE: &str = "config.json";
+
+// Path to OCI configuration template
+const OCI_CONFIG_TEMPLATE: &str =
+    "/opt/kata/share/defaults/kata-containers/agent-ctl/oci_config.json";
 
 lazy_static! {
     // Create a mutable hash map statically
@@ -239,7 +236,8 @@ pub fn random_container_id() -> String {
 
 fn config_file_from_bundle_dir(bundle_dir: &str) -> Result<String> {
     if bundle_dir.is_empty() {
-        return Err(anyhow!("missing bundle directory"));
+        debug!(sl!(), "bundle dir is empty");
+        return Ok("".to_owned());
     }
 
     let config_path = PathBuf::from(&bundle_dir).join(CONFIG_FILE);
@@ -251,7 +249,7 @@ fn config_file_from_bundle_dir(bundle_dir: &str) -> Result<String> {
 }
 
 fn root_oci_to_ttrpc(bundle_dir: &str, root: &ociRoot) -> Result<ttrpcRoot> {
-    let root_dir = root.path.clone();
+    let root_dir = root.path().clone().display().to_string();
 
     let path = if root_dir.starts_with('/') {
         root_dir
@@ -267,436 +265,37 @@ fn root_oci_to_ttrpc(bundle_dir: &str, root: &ociRoot) -> Result<ttrpcRoot> {
 
     let ttrpc_root = ttrpcRoot {
         Path: path,
-        Readonly: root.readonly,
-        unknown_fields: protobuf::UnknownFields::new(),
-        cached_size: protobuf::CachedSize::default(),
+        Readonly: root.readonly().unwrap_or_default(),
+        ..Default::default()
     };
 
     Ok(ttrpc_root)
 }
 
-fn process_oci_to_ttrpc(p: &ociProcess) -> ttrpcProcess {
-    let console_size = match &p.console_size {
-        Some(s) => {
-            let mut b = ttrpcBox::new();
-            b.set_Width(s.width);
-            b.set_Height(s.height);
-            protobuf::SingularPtrField::some(b)
-        }
-        None => protobuf::SingularPtrField::none(),
-    };
-
-    let oom_score_adj: i64 = match p.oom_score_adj {
-        Some(s) => s.into(),
-        None => 0,
-    };
-
-    let mut user = ttrpcUser::new();
-    user.set_UID(p.user.uid);
-    user.set_GID(p.user.gid);
-    user.set_AdditionalGids(p.user.additional_gids.clone());
-
-    // FIXME: Implement RLimits OCI spec handling (copy from p.rlimits)
-    //let rlimits = vec![ttrpcPOSIXRlimit::new()];
-    let rlimits = protobuf::RepeatedField::new();
-
-    let capabilities = match &p.capabilities {
-        Some(c) => {
-            let mut gc = ttrpcLinuxCapabilities::new();
-            gc.set_Bounding(protobuf::RepeatedField::from_slice(&c.bounding));
-            gc.set_Effective(protobuf::RepeatedField::from_slice(&c.effective));
-            gc.set_Inheritable(protobuf::RepeatedField::from_slice(&c.inheritable));
-            gc.set_Permitted(protobuf::RepeatedField::from_slice(&c.permitted));
-            gc.set_Ambient(protobuf::RepeatedField::from_slice(&c.ambient));
-
-            protobuf::SingularPtrField::some(gc)
-        }
-        None => protobuf::SingularPtrField::none(),
-    };
-
-    let mut env = protobuf::RepeatedField::new();
-    for pair in &p.env {
-        env.push(pair.to_string());
-    }
-
-    ttrpcProcess {
-        Terminal: p.terminal,
-        ConsoleSize: console_size,
-        User: protobuf::SingularPtrField::some(user),
-        Args: protobuf::RepeatedField::from_vec(p.args.clone()),
-        Env: env,
-        Cwd: p.cwd.clone(),
-        Capabilities: capabilities,
-        Rlimits: rlimits,
-        NoNewPrivileges: p.no_new_privileges,
-        ApparmorProfile: p.apparmor_profile.clone(),
-        OOMScoreAdj: oom_score_adj,
-        SelinuxLabel: p.selinux_label.clone(),
-        unknown_fields: protobuf::UnknownFields::new(),
-        cached_size: protobuf::CachedSize::default(),
-    }
-}
-
-fn mount_oci_to_ttrpc(m: &ociMount) -> ttrpcMount {
-    let mut ttrpc_options = protobuf::RepeatedField::new();
-    for op in &m.options {
-        ttrpc_options.push(op.to_string());
-    }
-
-    ttrpcMount {
-        destination: m.destination.clone(),
-        source: m.source.clone(),
-        field_type: m.r#type.clone(),
-        options: ttrpc_options,
-        unknown_fields: protobuf::UnknownFields::new(),
-        cached_size: protobuf::CachedSize::default(),
-    }
-}
-
-fn idmaps_oci_to_ttrpc(
-    res: &[oci::LinuxIdMapping],
-) -> protobuf::RepeatedField<ttrpcLinuxIDMapping> {
-    let mut ttrpc_idmaps = protobuf::RepeatedField::new();
-    for m in res.iter() {
-        let mut idmapping = ttrpcLinuxIDMapping::default();
-        idmapping.set_HostID(m.host_id);
-        idmapping.set_ContainerID(m.container_id);
-        idmapping.set_Size(m.size);
-        ttrpc_idmaps.push(idmapping);
-    }
-    ttrpc_idmaps
-}
-
-fn devices_oci_to_ttrpc(
-    res: &[oci::LinuxDeviceCgroup],
-) -> protobuf::RepeatedField<ttrpcLinuxDeviceCgroup> {
-    let mut ttrpc_devices = protobuf::RepeatedField::new();
-    for d in res.iter() {
-        let mut device = ttrpcLinuxDeviceCgroup::default();
-        device.set_Major(d.major.unwrap_or(0));
-        device.set_Minor(d.minor.unwrap_or(0));
-        device.set_Access(d.access.clone());
-        device.set_Type(d.r#type.clone());
-        device.set_Allow(d.allow);
-        ttrpc_devices.push(device);
-    }
-    ttrpc_devices
-}
-
-fn memory_oci_to_ttrpc(
-    res: &Option<oci::LinuxMemory>,
-) -> protobuf::SingularPtrField<ttrpcLinuxMemory> {
-    let memory = if res.is_some() {
-        let mem = res.as_ref().unwrap();
-        protobuf::SingularPtrField::some(ttrpcLinuxMemory {
-            Limit: mem.limit.unwrap_or(0),
-            Reservation: mem.reservation.unwrap_or(0),
-            Swap: mem.swap.unwrap_or(0),
-            Kernel: mem.kernel.unwrap_or(0),
-            KernelTCP: mem.kernel_tcp.unwrap_or(0),
-            Swappiness: mem.swappiness.unwrap_or(0),
-            DisableOOMKiller: mem.disable_oom_killer.unwrap_or(false),
-            unknown_fields: protobuf::UnknownFields::new(),
-            cached_size: protobuf::CachedSize::default(),
-        })
-    } else {
-        protobuf::SingularPtrField::none()
-    };
-    memory
-}
-
-fn cpu_oci_to_ttrpc(res: &Option<oci::LinuxCpu>) -> protobuf::SingularPtrField<ttrpcLinuxCPU> {
-    match &res {
-        Some(s) => {
-            let mut cpu = ttrpcLinuxCPU::default();
-            cpu.set_Shares(s.shares.unwrap_or(0));
-            cpu.set_Quota(s.quota.unwrap_or(0));
-            cpu.set_Period(s.period.unwrap_or(0));
-            cpu.set_RealtimeRuntime(s.realtime_runtime.unwrap_or(0));
-            cpu.set_RealtimePeriod(s.realtime_period.unwrap_or(0));
-            protobuf::SingularPtrField::some(cpu)
-        }
-        None => protobuf::SingularPtrField::none(),
-    }
-}
-
-fn pids_oci_to_ttrpc(res: &Option<oci::LinuxPids>) -> protobuf::SingularPtrField<ttrpcLinuxPids> {
-    match &res {
-        Some(s) => {
-            let mut b = ttrpcLinuxPids::new();
-            b.set_Limit(s.limit);
-            protobuf::SingularPtrField::some(b)
-        }
-        None => protobuf::SingularPtrField::none(),
-    }
-}
-
-fn hugepage_limits_oci_to_ttrpc(
-    res: &[oci::LinuxHugepageLimit],
-) -> protobuf::RepeatedField<ttrpcLinuxHugepageLimit> {
-    let mut ttrpc_hugepage_limits = protobuf::RepeatedField::new();
-    for h in res.iter() {
-        let mut hugepage_limit = ttrpcLinuxHugepageLimit::default();
-        hugepage_limit.set_Limit(h.limit);
-        hugepage_limit.set_Pagesize(h.page_size.clone());
-        ttrpc_hugepage_limits.push(hugepage_limit);
-    }
-    ttrpc_hugepage_limits
-}
-
-fn network_oci_to_ttrpc(
-    res: &Option<oci::LinuxNetwork>,
-) -> protobuf::SingularPtrField<ttrpcLinuxNetwork> {
-    match &res {
-        Some(s) => {
-            let mut b = ttrpcLinuxNetwork::new();
-            b.set_ClassID(s.class_id.unwrap_or(0));
-            let mut priorities = protobuf::RepeatedField::new();
-            for pr in s.priorities.iter() {
-                let mut lip = ttrpcLinuxInterfacePriority::new();
-                lip.set_Name(pr.name.clone());
-                lip.set_Priority(pr.priority);
-                priorities.push(lip);
-            }
-            protobuf::SingularPtrField::some(b)
-        }
-        None => protobuf::SingularPtrField::none(),
-    }
-}
-
-fn weight_devices_oci_to_ttrpc(
-    res: &[oci::LinuxWeightDevice],
-) -> protobuf::RepeatedField<ttrpcLinuxWeightDevice> {
-    let mut ttrpc_weight_devices = protobuf::RepeatedField::new();
-    for dev in res.iter() {
-        let mut device = ttrpcLinuxWeightDevice::default();
-        device.set_Major(dev.blk.major);
-        device.set_Minor(dev.blk.minor);
-        let weight: u32 = match dev.weight {
-            Some(s) => s.into(),
-            None => 0,
-        };
-        device.set_Weight(weight);
-        let leaf_weight: u32 = match dev.leaf_weight {
-            Some(s) => s.into(),
-            None => 0,
-        };
-        device.set_LeafWeight(leaf_weight);
-        ttrpc_weight_devices.push(device);
-    }
-    ttrpc_weight_devices
-}
-
-fn throttle_devices_oci_to_ttrpc(
-    res: &[oci::LinuxThrottleDevice],
-) -> protobuf::RepeatedField<ttrpcLinuxThrottleDevice> {
-    let mut ttrpc_throttle_devices = protobuf::RepeatedField::new();
-    for dev in res.iter() {
-        let mut device = ttrpcLinuxThrottleDevice::default();
-        device.set_Major(dev.blk.major);
-        device.set_Minor(dev.blk.minor);
-        device.set_Rate(dev.rate);
-        ttrpc_throttle_devices.push(device);
-    }
-    ttrpc_throttle_devices
-}
-
-fn block_io_oci_to_ttrpc(
-    res: &Option<oci::LinuxBlockIo>,
-) -> protobuf::SingularPtrField<ttrpcLinuxBlockIO> {
-    match &res {
-        Some(s) => {
-            let mut b = ttrpcLinuxBlockIO::new();
-            let weight: u32 = match s.weight {
-                Some(s) => s.into(),
-                None => 0,
-            };
-            let leaf_weight: u32 = match s.leaf_weight {
-                Some(s) => s.into(),
-                None => 0,
-            };
-
-            b.set_Weight(weight);
-            b.set_LeafWeight(leaf_weight);
-            b.set_WeightDevice(weight_devices_oci_to_ttrpc(&s.weight_device));
-            b.set_ThrottleReadBpsDevice(throttle_devices_oci_to_ttrpc(&s.throttle_read_bps_device));
-            b.set_ThrottleReadIOPSDevice(throttle_devices_oci_to_ttrpc(
-                &s.throttle_read_iops_device,
-            ));
-            b.set_ThrottleWriteBpsDevice(throttle_devices_oci_to_ttrpc(
-                &s.throttle_write_bps_device,
-            ));
-            b.set_ThrottleWriteIOPSDevice(throttle_devices_oci_to_ttrpc(
-                &s.throttle_write_iops_device,
-            ));
-            protobuf::SingularPtrField::some(b)
-        }
-        None => protobuf::SingularPtrField::none(),
-    }
-}
-
-fn resources_oci_to_ttrpc(res: &oci::LinuxResources) -> ttrpcLinuxResources {
-    let devices = devices_oci_to_ttrpc(&res.devices);
-    let memory = memory_oci_to_ttrpc(&res.memory);
-    let cpu = cpu_oci_to_ttrpc(&res.cpu);
-    let pids = pids_oci_to_ttrpc(&res.pids);
-    let hugepage_limits = hugepage_limits_oci_to_ttrpc(&res.hugepage_limits);
-    let block_io = block_io_oci_to_ttrpc(&res.block_io);
-
-    let network = network_oci_to_ttrpc(&res.network);
-    ttrpcLinuxResources {
-        Devices: devices,
-        Memory: memory,
-        CPU: cpu,
-        Pids: pids,
-        BlockIO: block_io,
-        HugepageLimits: hugepage_limits,
-        Network: network,
-        unknown_fields: protobuf::UnknownFields::new(),
-        cached_size: protobuf::CachedSize::default(),
-    }
-}
-
-fn namespace_oci_to_ttrpc(
-    res: &[oci::LinuxNamespace],
-) -> protobuf::RepeatedField<ttrpcLinuxNamespace> {
-    let mut ttrpc_namespace = protobuf::RepeatedField::new();
-    for n in res.iter() {
-        let mut ns = ttrpcLinuxNamespace::default();
-        ns.set_Path(n.path.clone());
-        ns.set_Type(n.r#type.clone());
-        ttrpc_namespace.push(ns);
-    }
-    ttrpc_namespace
-}
-
-fn linux_devices_oci_to_ttrpc(
-    res: &[oci::LinuxDevice],
-) -> protobuf::RepeatedField<ttrpcLinuxDevice> {
-    let mut ttrpc_linux_devices = protobuf::RepeatedField::new();
-    for n in res.iter() {
-        let mut ld = ttrpcLinuxDevice::default();
-        ld.set_FileMode(n.file_mode.unwrap_or(0));
-        ld.set_GID(n.gid.unwrap_or(0));
-        ld.set_UID(n.uid.unwrap_or(0));
-        ld.set_Major(n.major);
-        ld.set_Minor(n.minor);
-        ld.set_Path(n.path.clone());
-        ld.set_Type(n.r#type.clone());
-        ttrpc_linux_devices.push(ld);
-    }
-    ttrpc_linux_devices
-}
-
-fn seccomp_oci_to_ttrpc(sec: &oci::LinuxSeccomp) -> ttrpcLinuxSeccomp {
-    let mut ttrpc_seccomp = ttrpcLinuxSeccomp::default();
-    let mut ttrpc_arch = protobuf::RepeatedField::new();
-    for a in &sec.architectures {
-        ttrpc_arch.push(std::string::String::from(a));
-    }
-    ttrpc_seccomp.set_Architectures(ttrpc_arch);
-    ttrpc_seccomp.set_DefaultAction(sec.default_action.clone());
-    let mut ttrpc_flags = protobuf::RepeatedField::new();
-    for f in &sec.flags {
-        ttrpc_flags.push(std::string::String::from(f));
-    }
-    ttrpc_seccomp.set_Flags(ttrpc_flags);
-    let mut ttrpc_syscalls = protobuf::RepeatedField::new();
-    for sys in &sec.syscalls {
-        let mut ttrpc_sys = ttrpcLinuxSyscall::default();
-        ttrpc_sys.set_Action(sys.action.clone());
-        let mut ttrpc_args = protobuf::RepeatedField::new();
-        for arg in &sys.args {
-            let mut a = ttrpcLinuxSeccompArg::default();
-            a.set_Index(arg.index as u64);
-            a.set_Op(arg.op.clone());
-            a.set_Value(arg.value);
-            a.set_ValueTwo(arg.value_two);
-            ttrpc_args.push(a);
-        }
-        ttrpc_sys.set_Args(ttrpc_args);
-        ttrpc_syscalls.push(ttrpc_sys);
-    }
-    ttrpc_seccomp.set_Syscalls(ttrpc_syscalls);
-    ttrpc_seccomp
-}
-fn intel_rdt_oci_to_ttrpc(ir: &oci::LinuxIntelRdt) -> ttrpcLinuxIntelRdt {
-    let mut ttrpc_intel_rdt = ttrpcLinuxIntelRdt::default();
-    ttrpc_intel_rdt.set_L3CacheSchema(ir.l3_cache_schema.clone());
-    ttrpc_intel_rdt
-}
-fn linux_oci_to_ttrpc(l: &ociLinux) -> ttrpcLinux {
-    let uid_mappings = idmaps_oci_to_ttrpc(&l.uid_mappings);
-    let gid_mappings = idmaps_oci_to_ttrpc(&l.gid_mappings);
-
-    let ttrpc_linux_resources = match &l.resources {
-        Some(s) => {
-            let b = resources_oci_to_ttrpc(s);
-            protobuf::SingularPtrField::some(b)
-        }
-        None => protobuf::SingularPtrField::none(),
-    };
-
-    let ttrpc_namespaces = namespace_oci_to_ttrpc(&l.namespaces);
-    let ttrpc_linux_devices = linux_devices_oci_to_ttrpc(&l.devices);
-    let ttrpc_seccomp = match &l.seccomp {
-        Some(s) => {
-            let b = seccomp_oci_to_ttrpc(s);
-            protobuf::SingularPtrField::some(b)
-        }
-        None => protobuf::SingularPtrField::none(),
-    };
-
-    let ttrpc_intel_rdt = match &l.intel_rdt {
-        Some(s) => {
-            let b = intel_rdt_oci_to_ttrpc(s);
-            protobuf::SingularPtrField::some(b)
-        }
-        None => protobuf::SingularPtrField::none(),
-    };
-
-    ttrpcLinux {
-        UIDMappings: uid_mappings,
-        GIDMappings: gid_mappings,
-        Sysctl: l.sysctl.clone(),
-        Resources: ttrpc_linux_resources,
-        CgroupsPath: l.cgroups_path.clone(),
-        Namespaces: ttrpc_namespaces,
-        Devices: ttrpc_linux_devices,
-        Seccomp: ttrpc_seccomp,
-        RootfsPropagation: l.rootfs_propagation.clone(),
-        MaskedPaths: protobuf::RepeatedField::from_slice(&l.masked_paths),
-        ReadonlyPaths: protobuf::RepeatedField::from_slice(&l.readonly_paths),
-        MountLabel: l.mount_label.clone(),
-        IntelRdt: ttrpc_intel_rdt,
-        unknown_fields: protobuf::UnknownFields::new(),
-        cached_size: protobuf::CachedSize::default(),
-    }
-}
-
 fn oci_to_ttrpc(bundle_dir: &str, cid: &str, oci: &ociSpec) -> Result<ttrpcSpec> {
-    let process = match &oci.process {
-        Some(p) => protobuf::SingularPtrField::some(process_oci_to_ttrpc(p)),
-        None => protobuf::SingularPtrField::none(),
+    let process = match &oci.process() {
+        Some(p) => protobuf::MessageField::some(p.clone().into()),
+        None => protobuf::MessageField::none(),
     };
 
-    let root = match &oci.root {
+    let root = match &oci.root() {
         Some(r) => {
             let ttrpc_root = root_oci_to_ttrpc(bundle_dir, r)?;
 
-            protobuf::SingularPtrField::some(ttrpc_root)
+            protobuf::MessageField::some(ttrpc_root)
         }
-        None => protobuf::SingularPtrField::none(),
+        None => protobuf::MessageField::none(),
     };
 
-    let mut mounts = protobuf::RepeatedField::new();
-    for m in &oci.mounts {
-        mounts.push(mount_oci_to_ttrpc(m));
+    let mut mounts: Vec<ttrpcMount> = Vec::new();
+    let oci_mounts = oci.mounts().clone().unwrap_or_default();
+    for m in oci_mounts {
+        mounts.push(m.clone().into());
     }
 
-    let linux = match &oci.linux {
-        Some(l) => protobuf::SingularPtrField::some(linux_oci_to_ttrpc(l)),
-        None => protobuf::SingularPtrField::none(),
+    let linux = match &oci.linux() {
+        Some(l) => protobuf::MessageField::some(l.clone().into()),
+        None => protobuf::MessageField::none(),
     };
 
     if cid.len() < MIN_HOSTNAME_LEN as usize {
@@ -708,18 +307,17 @@ fn oci_to_ttrpc(bundle_dir: &str, cid: &str, oci: &ociSpec) -> Result<ttrpcSpec>
     let hostname = "".to_string();
 
     let ttrpc_spec = ttrpcSpec {
-        Version: oci.version.clone(),
+        Version: oci.version().clone(),
         Process: process,
         Root: root,
         Hostname: hostname,
         Mounts: mounts,
-        Hooks: protobuf::SingularPtrField::none(),
+        Hooks: protobuf::MessageField::none(),
         Annotations: HashMap::new(),
         Linux: linux,
-        Solaris: protobuf::SingularPtrField::none(),
-        Windows: protobuf::SingularPtrField::none(),
-        unknown_fields: protobuf::UnknownFields::new(),
-        cached_size: protobuf::CachedSize::default(),
+        Solaris: protobuf::MessageField::none(),
+        Windows: protobuf::MessageField::none(),
+        ..Default::default()
     };
 
     Ok(ttrpc_spec)
@@ -742,13 +340,18 @@ fn split_uri(uri: &str) -> Result<(String, String)> {
 }
 
 pub fn spec_file_to_string(spec_file: String) -> Result<String> {
-    let oci_spec = ociSpec::load(&spec_file).map_err(|e| anyhow!(e))?;
+    let oci_spec = ociSpec::load(spec_file).map_err(|e| anyhow!(e))?;
 
     serde_json::to_string(&oci_spec).map_err(|e| anyhow!(e))
 }
 
 pub fn get_oci_spec_json(cfg: &Config) -> Result<String> {
     let spec_file = config_file_from_bundle_dir(&cfg.bundle_dir)?;
+
+    if spec_file.is_empty() {
+        debug!(sl!(), "Empty bundle dir");
+        return Ok("".to_owned());
+    }
 
     spec_file_to_string(spec_file)
 }
@@ -840,4 +443,124 @@ pub fn make_request<T: Default + DeserializeOwned>(args: &str) -> Result<T> {
         // are not handled by this functionz.
         _ => Ok(Default::default()),
     }
+}
+
+pub fn make_copy_file_request(input: &CopyFileInput) -> Result<CopyFileRequest> {
+    // create dir mode permissions
+    // Dir mode | 750
+    let perms = 0o20000000750;
+
+    let src_meta: fs::Metadata = fs::symlink_metadata(&input.src)?;
+
+    let mut req = CopyFileRequest::default();
+
+    req.set_path(input.dest.clone());
+    req.set_dir_mode(perms);
+    req.set_file_mode(src_meta.mode());
+    req.set_uid(src_meta.uid() as i32);
+    req.set_gid(src_meta.gid() as i32);
+    req.set_offset(0);
+    req.set_file_size(0);
+
+    if src_meta.is_symlink() {
+        match fs::read_link(&input.src)?.into_os_string().into_string() {
+            Ok(path) => {
+                req.set_data(path.into_bytes());
+            }
+            Err(_) => {
+                return Err(anyhow!("failed to read link for {}", input.src));
+            }
+        }
+    } else if src_meta.is_file() {
+        req.set_file_size(src_meta.size() as i64);
+    }
+
+    Ok(req)
+}
+
+pub fn make_set_policy_request(input: &SetPolicyInput) -> Result<SetPolicyRequest> {
+    let mut policy_file = File::open(&input.policy_file)?;
+    let metadata = policy_file.metadata()?;
+
+    let mut policy_data = String::new();
+    match policy_file.read_to_string(&mut policy_data) {
+        Ok(bytes_read) => {
+            if bytes_read != metadata.len() as usize {
+                return Err(anyhow!(
+                    "Failed to read all policy data, size {} read {}",
+                    metadata.len(),
+                    bytes_read
+                ));
+            }
+        }
+        Err(e) => return Err(anyhow!("Error reading policy file: {}", e)),
+    }
+
+    let mut req = SetPolicyRequest::default();
+    req.set_policy(policy_data);
+    Ok(req)
+}
+
+fn fix_oci_process_args(spec: &mut ttrpcSpec, bundle: &str) -> Result<()> {
+    let config_path = scoped_join(bundle, CONFIG_FILE)?;
+
+    let file = File::open(config_path)?;
+    let oci_from_config: ociSpec = serde_json::from_reader(file)?;
+
+    let mut process: ttrpcProcess = match &oci_from_config.process() {
+        Some(p) => p.clone().into(),
+        None => {
+            return Err(anyhow!("Failed to set container process args"));
+        }
+    };
+
+    spec.take_Process().set_Args(process.take_Args());
+    Ok(())
+}
+
+// Helper function to generate create container request
+pub fn make_create_container_request(
+    input: CreateContainerInput,
+) -> Result<CreateContainerRequest> {
+    // read in the oci configuration template
+    if !Path::new(OCI_CONFIG_TEMPLATE).exists() {
+        warn!(sl!(), "make_create_container_request: Missig template file");
+        return Err(anyhow!("Missing OCI Config template file"));
+    }
+
+    let file = File::open(OCI_CONFIG_TEMPLATE)?;
+    let spec: ociSpec = serde_json::from_reader(file)?;
+
+    let mut req = CreateContainerRequest::default();
+
+    let c_id = if !input.id.is_empty() {
+        input.id
+    } else {
+        random_container_id()
+    };
+
+    debug!(
+        sl!(),
+        "make_create_container_request: pulling container image"
+    );
+
+    // Pull and unpack the container image
+    let bundle = image::pull_image(&input.image, &c_id)?;
+
+    let mut ttrpc_spec = oci_to_ttrpc(&bundle, &c_id, &spec)?;
+
+    // Rootfs has been handled with bundle after pulling image
+    // Fix the container process argument.
+    fix_oci_process_args(&mut ttrpc_spec, &bundle)?;
+
+    req.set_container_id(c_id);
+    req.set_OCI(ttrpc_spec);
+
+    debug!(sl!(), "CreateContainer request generated successfully");
+
+    Ok(req)
+}
+
+pub fn remove_container_image_mount(c_id: &str) -> Result<()> {
+    image::remove_image_mount(c_id)
 }

@@ -16,13 +16,17 @@ import (
 	"path"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 
+	taskAPI "github.com/containerd/containerd/api/runtime/task/v2"
 	containerd_types "github.com/containerd/containerd/api/types"
 	"github.com/containerd/containerd/mount"
-	taskAPI "github.com/containerd/containerd/runtime/v2/task"
-	"github.com/containerd/typeurl"
+	"github.com/containerd/typeurl/v2"
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/config"
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/utils"
+	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers"
+	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/annotations"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/rootless"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pkg/errors"
@@ -48,6 +52,28 @@ var defaultStartManagementServerFunc startManagementServerFunc = func(s *service
 	shimLog.Info("management server started")
 }
 
+func copyLayersToMounts(rootFs *vc.RootFs, spec *specs.Spec) error {
+	for _, o := range rootFs.Options {
+		if !strings.HasPrefix(o, annotations.FileSystemLayer) {
+			continue
+		}
+
+		fields := strings.Split(o[len(annotations.FileSystemLayer):], ",")
+		if len(fields) < 2 {
+			return fmt.Errorf("Missing fields in rootfs layer: %q", o)
+		}
+
+		spec.Mounts = append(spec.Mounts, specs.Mount{
+			Destination: "/run/kata-containers/sandbox/layers/" + filepath.Base(fields[0]),
+			Type:        fields[1],
+			Source:      fields[0],
+			Options:     fields[2:],
+		})
+	}
+
+	return nil
+}
+
 func create(ctx context.Context, s *service, r *taskAPI.CreateTaskRequest) (*container, error) {
 	rootFs := vc.RootFs{}
 	if len(r.Rootfs) == 1 {
@@ -63,6 +89,11 @@ func create(ctx context.Context, s *service, r *taskAPI.CreateTaskRequest) (*con
 	if err != nil {
 		return nil, err
 	}
+
+	if err := copyLayersToMounts(&rootFs, ociSpec); err != nil {
+		return nil, err
+	}
+
 	containerType, err := oci.ContainerType(*ociSpec)
 	if err != nil {
 		return nil, err
@@ -80,6 +111,20 @@ func create(ctx context.Context, s *service, r *taskAPI.CreateTaskRequest) (*con
 	case vc.PodSandbox, vc.SingleContainer:
 		if s.sandbox != nil {
 			return nil, fmt.Errorf("cannot create another sandbox in sandbox: %s", s.sandbox.ID())
+		}
+		// We can provide additional directories where to search for
+		// CDI specs if needed. immutable OS's only have specific
+		// directories where applications can write too. For instance /opt/cdi
+		//
+		// _, err = withCDI(ociSpec.Annotations, []string{"/opt/cdi"}, ociSpec)
+		//
+		// Only inject CDI devices if single_container we do not want
+		// CDI devices in the pod_sandbox
+		if containerType == vc.SingleContainer {
+			_, err = config.WithCDI(ociSpec.Annotations, []string{}, ociSpec)
+			if err != nil {
+				return nil, fmt.Errorf("adding CDI devices failed")
+			}
 		}
 
 		s.config = runtimeConfig
@@ -268,7 +313,12 @@ func checkAndMount(s *service, r *taskAPI.CreateTaskRequest) (bool, error) {
 		if katautils.IsBlockDevice(m.Source) && !s.config.HypervisorConfig.DisableBlockDeviceUse {
 			return false, nil
 		}
-		if m.Type == vc.NydusRootFSType {
+
+		if virtcontainers.HasOptionPrefix(m.Options, annotations.FileSystemLayer) {
+			return false, nil
+		}
+
+		if vc.IsNydusRootFSType(m.Type) {
 			// if kata + nydus, do not mount
 			return false, nil
 		}

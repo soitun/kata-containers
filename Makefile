@@ -1,4 +1,4 @@
-# Copyright (c) 2020 Intel Corporation
+# Copyright (c) 2020-2023 Intel Corporation
 #
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -23,6 +23,10 @@ TOOLS += trace-forwarder
 
 STANDARD_TARGETS = build check clean install static-checks-build test vendor
 
+# Variables for the build-and-publish-kata-debug target
+KATA_DEBUG_REGISTRY ?= ""
+KATA_DEBUG_TAG ?= ""
+
 default: all
 
 include utils.mk
@@ -38,10 +42,13 @@ generate-protocols:
 
 # Some static checks rely on generated source files of components.
 static-checks: static-checks-build
-	bash ci/static-checks.sh
+	bash tests/static-checks.sh github.com/kata-containers/kata-containers
 
 docs-url-alive-check:
 	bash ci/docs-url-alive-check.sh
+
+build-and-publish-kata-debug:
+	bash tools/packaging/kata-debug/kata-debug-build-and-upload-payload.sh ${KATA_DEBUG_REGISTRY} ${KATA_DEBUG_TAG} 
 
 .PHONY: \
 	all \

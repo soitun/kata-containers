@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"testing"
 
+	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 )
@@ -146,26 +147,23 @@ func TestWriteToFile(t *testing.T) {
 	assert.True(reflect.DeepEqual(testData, data))
 }
 
-func TestCalculateMilliCPUs(t *testing.T) {
+func TestCalculateCPUsF(t *testing.T) {
 	assert := assert.New(t)
 
-	n := CalculateMilliCPUs(1, 1)
-	expected := uint32(1000)
+	n := CalculateCPUsF(1, 1)
+	expected := float32(1)
 	assert.Equal(n, expected)
 
-	n = CalculateMilliCPUs(1, 0)
-	expected = uint32(0)
+	n = CalculateCPUsF(1, 0)
+	expected = float32(0)
 	assert.Equal(n, expected)
 
-	n = CalculateMilliCPUs(-1, 1)
+	n = CalculateCPUsF(-1, 1)
+	expected = float32(0)
 	assert.Equal(n, expected)
-}
 
-func TestCaluclateVCpusFromMilliCpus(t *testing.T) {
-	assert := assert.New(t)
-
-	n := CalculateVCpusFromMilliCpus(1)
-	expected := uint32(1)
+	n = CalculateCPUsF(500, 1000)
+	expected = float32(0.5)
 	assert.Equal(n, expected)
 }
 
@@ -579,4 +577,26 @@ func TestRevertBytes(t *testing.T) {
 
 	num := RevertBytes(testNum)
 	assert.Equal(expectedNum, num)
+}
+
+func TestIsDockerContainer(t *testing.T) {
+	assert := assert.New(t)
+
+	ociSpec := &specs.Spec{
+		Hooks: &specs.Hooks{
+			Prestart: []specs.Hook{
+				{
+					Args: []string{
+						"haha",
+					},
+				},
+			},
+		},
+	}
+	assert.False(IsDockerContainer(ociSpec))
+
+	ociSpec.Hooks.Prestart = append(ociSpec.Hooks.Prestart, specs.Hook{
+		Args: []string{"libnetwork-xxx"},
+	})
+	assert.True(IsDockerContainer(ociSpec))
 }

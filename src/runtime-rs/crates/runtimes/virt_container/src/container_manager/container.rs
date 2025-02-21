@@ -17,9 +17,13 @@ use common::{
     },
 };
 use kata_sys_util::k8s::update_ephemeral_storage_type;
+use kata_types::k8s;
+use oci_spec::runtime as oci;
 
 use oci::{LinuxResources, Process as OCIProcess};
-use resource::ResourceManager;
+use resource::{
+    cdi_devices::container_device::annotate_container_devices, ResourceManager, ResourceUpdateOp,
+};
 use tokio::sync::RwLock;
 
 use super::{
@@ -42,15 +46,17 @@ pub struct Container {
     agent: Arc<dyn Agent>,
     resource_manager: Arc<ResourceManager>,
     logger: slog::Logger,
+    pub(crate) passfd_listener_addr: Option<(String, u32)>,
 }
 
 impl Container {
-    pub fn new(
+    pub async fn new(
         pid: u32,
         config: ContainerConfig,
         spec: oci::Spec,
         agent: Arc<dyn Agent>,
         resource_manager: Arc<ResourceManager>,
+        passfd_listener_addr: Option<(String, u32)>,
     ) -> Result<Self> {
         let container_id = ContainerID::new(&config.container_id).context("new container id")?;
         let logger = sl!().new(o!("container_id" => config.container_id.clone()));
@@ -64,6 +70,10 @@ impl Container {
             config.stderr.clone(),
             config.terminal,
         );
+        let linux_resources = spec
+            .linux()
+            .as_ref()
+            .and_then(|linux| linux.resources().clone());
 
         Ok(Self {
             pid,
@@ -74,10 +84,12 @@ impl Container {
                 agent.clone(),
                 init_process,
                 logger.clone(),
+                linux_resources,
             ))),
             agent,
             resource_manager,
             logger,
+            passfd_listener_addr,
         })
     }
 
@@ -87,10 +99,26 @@ impl Container {
         let toml_config = self.resource_manager.config().await;
         let config = &self.config;
         let sandbox_pidns = is_pid_namespace_enabled(&spec);
-        amend_spec(&mut spec, toml_config.runtime.disable_guest_seccomp).context("amend spec")?;
+        let disable_guest_selinux = match toml_config
+            .hypervisor
+            .get(&toml_config.runtime.hypervisor_name)
+        {
+            Some(hypervisor_config) => hypervisor_config.disable_guest_selinux,
+            // This shouldn't happen due to how logic in the config crate works
+            // but we need to handle it anyway so we stick with the default
+            // value of disable_guest_selinux in configuration.toml which
+            // is 'true'.
+            None => true,
+        };
+        amend_spec(
+            &mut spec,
+            toml_config.runtime.disable_guest_seccomp,
+            disable_guest_selinux,
+        )
+        .context("amend spec")?;
 
         // get mutable root from oci spec
-        let mut root = match spec.root.as_mut() {
+        let root = match spec.root_mut() {
             Some(root) => root,
             None => return Err(anyhow!("spec miss root field")),
         };
@@ -108,10 +136,13 @@ impl Container {
             .context("handler rootfs")?;
 
         // update rootfs
-        root.path = rootfs
-            .get_guest_rootfs_path()
-            .await
-            .context("get guest rootfs path")?;
+        root.set_path(
+            rootfs
+                .get_guest_rootfs_path()
+                .await
+                .context("get guest rootfs path")?
+                .into(),
+        );
 
         let mut storages = vec![];
         if let Some(storage) = rootfs.get_storage().await {
@@ -138,19 +169,58 @@ impl Container {
             }
             inner.volumes.push(v);
         }
-        spec.mounts = oci_mounts;
+        spec.set_mounts(Some(oci_mounts));
 
-        // TODO: handler device
+        let linux = spec
+            .linux()
+            .as_ref()
+            .context("OCI spec missing linux field")?;
 
-        // update cgroups
-        self.resource_manager
-            .update_cgroups(
+        let container_devices = self
+            .resource_manager
+            .handler_devices(&config.container_id, linux)
+            .await?;
+        let devices_agent = annotate_container_devices(&mut spec, container_devices)
+            .context("annotate container devices failed")?;
+
+        // update vcpus, mems and host cgroups
+        let resources = self
+            .resource_manager
+            .update_linux_resource(
                 &config.container_id,
-                spec.linux
-                    .as_ref()
-                    .and_then(|linux| linux.resources.as_ref()),
+                inner.linux_resources.as_ref(),
+                ResourceUpdateOp::Add,
             )
             .await?;
+        if let Some(linux) = &mut spec.linux_mut() {
+            linux.set_resources(resources);
+        }
+
+        let container_name = k8s::container_name(&spec);
+        let mut shared_mounts = Vec::new();
+        for shared_mount in &toml_config.runtime.shared_mounts {
+            if shared_mount.dst_ctr == container_name {
+                let m = agent::types::SharedMount {
+                    name: shared_mount.name.clone(),
+                    src_ctr: shared_mount.src_ctr.clone(),
+                    src_path: shared_mount.src_path.clone(),
+                    dst_ctr: shared_mount.dst_ctr.clone(),
+                    dst_path: shared_mount.dst_path.clone(),
+                };
+                shared_mounts.push(m);
+            }
+        }
+
+        // In passfd io mode, we create vsock connections for io in advance
+        // and pass port info to agent in `CreateContainerRequest`.
+        // These vsock connections will be used as stdin/stdout/stderr of the container process.
+        // See agent/src/passfd_io.rs for more details.
+        if let Some((hvsock_uds_path, passfd_port)) = &self.passfd_listener_addr {
+            inner
+                .init_process
+                .passfd_io_init(hvsock_uds_path, *passfd_port)
+                .await?;
+        }
 
         // create container
         let r = agent::CreateContainerRequest {
@@ -158,6 +228,23 @@ impl Container {
             storages,
             oci: Some(spec),
             sandbox_pidns,
+            devices: devices_agent,
+            shared_mounts,
+            stdin_port: inner
+                .init_process
+                .passfd_io
+                .as_ref()
+                .and_then(|io| io.stdin_port),
+            stdout_port: inner
+                .init_process
+                .passfd_io
+                .as_ref()
+                .and_then(|io| io.stdout_port),
+            stderr_port: inner
+                .init_process
+                .passfd_io
+                .as_ref()
+                .and_then(|io| io.stderr_port),
             ..Default::default()
         };
 
@@ -169,28 +256,53 @@ impl Container {
         Ok(())
     }
 
-    pub async fn start(&self, process: &ContainerProcess) -> Result<()> {
+    pub async fn start(
+        &self,
+        containers: Arc<RwLock<HashMap<String, Container>>>,
+        process: &ContainerProcess,
+    ) -> Result<()> {
         let mut inner = self.inner.write().await;
         match process.process_type {
             ProcessType::Container => {
                 if let Err(err) = inner.start_container(&process.container_id).await {
-                    let _ = inner.stop_process(process, true).await;
+                    let device_manager = self.resource_manager.get_device_manager().await;
+                    let _ = inner.stop_process(process, true, &device_manager).await;
                     return Err(err);
                 }
 
-                let container_io = inner.new_container_io(process).await?;
-                inner
-                    .init_process
-                    .start_io_and_wait(self.agent.clone(), container_io)
-                    .await?;
+                if self.passfd_listener_addr.is_some() {
+                    inner
+                        .init_process
+                        .passfd_io_wait(containers, self.agent.clone())
+                        .await?;
+                } else {
+                    let container_io = inner.new_container_io(process).await?;
+                    inner
+                        .init_process
+                        .start_io_and_wait(containers, self.agent.clone(), container_io)
+                        .await?;
+                }
             }
             ProcessType::Exec => {
-                if let Err(e) = inner.start_exec_process(process).await {
-                    let _ = inner.stop_process(process, true).await;
-                    return Err(e).context("enter process");
+                // In passfd io mode, we create vsock connections for io in advance
+                // and pass port info to agent in `ExecProcessRequest`.
+                // These vsock connections will be used as stdin/stdout/stderr of the exec process.
+                // See agent/src/passfd_io.rs for more details.
+                if let Some((hvsock_uds_path, passfd_port)) = &self.passfd_listener_addr {
+                    let exec = inner
+                        .exec_processes
+                        .get_mut(&process.exec_id)
+                        .ok_or_else(|| Error::ProcessNotFound(process.clone()))?;
+                    exec.process
+                        .passfd_io_init(hvsock_uds_path, *passfd_port)
+                        .await?;
                 }
 
-                let container_io = inner.new_container_io(process).await.context("io stream")?;
+                if let Err(e) = inner.start_exec_process(process).await {
+                    let device_manager = self.resource_manager.get_device_manager().await;
+                    let _ = inner.stop_process(process, true, &device_manager).await;
+                    return Err(e).context("enter process");
+                }
 
                 {
                     let exec = inner
@@ -205,15 +317,31 @@ impl Container {
                     }
                 }
 
-                // start io and wait
-                {
+                if self.passfd_listener_addr.is_some() {
+                    // In passfd io mode, we don't bother with the IO.
+                    // We send `WaitProcessRequest` immediately to the agent
+                    // and wait for the response in a separate thread.
+                    // The agent will only respond after IO is done.
                     let exec = inner
                         .exec_processes
                         .get_mut(&process.exec_id)
                         .ok_or_else(|| Error::ProcessNotFound(process.clone()))?;
-
                     exec.process
-                        .start_io_and_wait(self.agent.clone(), container_io)
+                        .passfd_io_wait(containers, self.agent.clone())
+                        .await?;
+                } else {
+                    // In legacy io mode, we handle IO by polling the agent.
+                    // When IO is done, we send `WaitProcessRequest` to agent
+                    // to get the exit status.
+                    let container_io =
+                        inner.new_container_io(process).await.context("io stream")?;
+
+                    let exec = inner
+                        .exec_processes
+                        .get_mut(&process.exec_id)
+                        .ok_or_else(|| Error::ProcessNotFound(process.clone()))?;
+                    exec.process
+                        .start_io_and_wait(containers, self.agent.clone(), container_io)
                         .await
                         .context("start io and wait")?;
                 }
@@ -305,35 +433,63 @@ impl Container {
 
     pub async fn stop_process(&self, container_process: &ContainerProcess) -> Result<()> {
         let mut inner = self.inner.write().await;
+        let device_manager = self.resource_manager.get_device_manager().await;
         inner
-            .stop_process(container_process, true)
+            .stop_process(container_process, true, &device_manager)
             .await
-            .context("stop process")
+            .context("stop process")?;
+
+        // update vcpus, mems and host cgroups
+        if container_process.process_type == ProcessType::Container {
+            self.resource_manager
+                .update_linux_resource(
+                    &self.config.container_id,
+                    inner.linux_resources.as_ref(),
+                    ResourceUpdateOp::Del,
+                )
+                .await?;
+        }
+
+        Ok(())
     }
 
     pub async fn pause(&self) -> Result<()> {
-        let inner = self.inner.read().await;
-        if inner.init_process.get_status().await == ProcessStatus::Paused {
-            warn!(self.logger, "container is paused no need to pause");
+        let mut inner = self.inner.write().await;
+        let status = inner.init_process.get_status().await;
+        if status != ProcessStatus::Running {
+            warn!(
+                self.logger,
+                "container is in {:?} state, will not pause", status
+            );
             return Ok(());
         }
+
         self.agent
             .pause_container(self.container_id.clone().into())
             .await
             .context("agent pause container")?;
+        inner.set_state(ProcessStatus::Paused).await;
+
         Ok(())
     }
 
     pub async fn resume(&self) -> Result<()> {
-        let inner = self.inner.read().await;
-        if inner.init_process.get_status().await == ProcessStatus::Running {
-            warn!(self.logger, "container is running no need to resume");
+        let mut inner = self.inner.write().await;
+        let status = inner.init_process.get_status().await;
+        if status != ProcessStatus::Paused {
+            warn!(
+                self.logger,
+                "container is in {:?} state, will not resume", status
+            );
             return Ok(());
         }
+
         self.agent
             .resume_container(self.container_id.clone().into())
             .await
             .context("agent pause container")?;
+        inner.set_state(ProcessStatus::Running).await;
+
         Ok(())
     }
 
@@ -383,13 +539,21 @@ impl Container {
     }
 
     pub async fn update(&self, resources: &LinuxResources) -> Result<()> {
-        self.resource_manager
-            .update_cgroups(&self.config.container_id, Some(resources))
+        let mut inner = self.inner.write().await;
+        inner.linux_resources = Some(resources.clone());
+        // update vcpus, mems and host cgroups
+        let agent_resources = self
+            .resource_manager
+            .update_linux_resource(
+                &self.config.container_id,
+                Some(resources),
+                ResourceUpdateOp::Update,
+            )
             .await?;
 
         let req = agent::UpdateContainerRequest {
             container_id: self.container_id.container_id.clone(),
-            resources: resources.clone(),
+            resources: agent_resources,
             mounts: Vec::new(),
         };
         self.agent
@@ -406,54 +570,76 @@ impl Container {
     pub async fn spec(&self) -> oci::Spec {
         self.spec.clone()
     }
+
+    pub async fn cleanup(&mut self) -> Result<()> {
+        let mut inner = self.inner.write().await;
+        let device_manager = self.resource_manager.get_device_manager().await;
+        inner
+            .cleanup_container(
+                self.container_id.container_id.as_str(),
+                true,
+                &device_manager,
+            )
+            .await
+    }
 }
 
-fn amend_spec(spec: &mut oci::Spec, disable_guest_seccomp: bool) -> Result<()> {
+fn amend_spec(
+    spec: &mut oci::Spec,
+    disable_guest_seccomp: bool,
+    disable_guest_selinux: bool,
+) -> Result<()> {
     // Only the StartContainer hook needs to be reserved for execution in the guest
-    let start_container_hooks = match spec.hooks.as_ref() {
-        Some(hooks) => hooks.start_container.clone(),
-        None => Vec::new(),
+    let start_container_hooks = if let Some(hooks) = spec.hooks().as_ref() {
+        hooks.start_container().clone()
+    } else {
+        None
     };
 
-    spec.hooks = if start_container_hooks.is_empty() {
-        None
-    } else {
-        Some(oci::Hooks {
-            start_container: start_container_hooks,
-            ..Default::default()
-        })
-    };
+    let mut oci_hooks = oci::Hooks::default();
+    oci_hooks.set_start_container(start_container_hooks);
+    spec.set_hooks(Some(oci_hooks));
 
     // special process K8s ephemeral volumes.
     update_ephemeral_storage_type(spec);
 
-    if let Some(linux) = spec.linux.as_mut() {
+    if let Some(linux) = spec.linux_mut() {
         if disable_guest_seccomp {
-            linux.seccomp = None;
+            linux.set_seccomp(None);
         }
 
-        if let Some(resource) = linux.resources.as_mut() {
-            resource.devices = Vec::new();
-            resource.pids = None;
-            resource.block_io = None;
-            resource.network = None;
-            resource.rdma = HashMap::new();
+        if let Some(_resource) = linux.resources_mut() {
+            LinuxResources::default();
         }
 
         // Host pidns path does not make sense in kata. Let's just align it with
         // sandbox namespace whenever it is set.
-        let mut ns: Vec<oci::LinuxNamespace> = Vec::new();
-        for n in linux.namespaces.iter() {
-            match n.r#type.as_str() {
-                oci::PIDNAMESPACE | oci::NETWORKNAMESPACE => continue,
-                _ => ns.push(oci::LinuxNamespace {
-                    r#type: n.r#type.clone(),
-                    path: "".to_string(),
-                }),
-            }
-        }
+        let ns: Vec<oci::LinuxNamespace> = linux
+            .namespaces()
+            .clone()
+            .unwrap_or_default()
+            .iter()
+            .filter(|n| {
+                n.typ() != oci::LinuxNamespaceType::Pid
+                    && n.typ() != oci::LinuxNamespaceType::Network
+            })
+            .map(|n| {
+                let mut ns = oci::LinuxNamespace::default();
+                ns.set_typ(n.typ());
+                ns
+            })
+            .collect();
 
-        linux.namespaces = ns;
+        linux.set_namespaces(if ns.is_empty() { None } else { Some(ns) });
+    }
+
+    if disable_guest_selinux {
+        if let Some(ref mut process) = spec.process_mut() {
+            process.set_selinux_label(None);
+        }
+        if let Some(ref mut linux) = spec.linux_mut() {
+            linux.set_mount_label(None);
+        }
     }
 
     Ok(())
@@ -462,10 +648,11 @@ fn amend_spec(spec: &mut oci::Spec, disable_guest_seccomp: bool) -> Result<()> {
 // is_pid_namespace_enabled checks if Pid namespace for a container needs to be shared with its sandbox
 // pid namespace.
 fn is_pid_namespace_enabled(spec: &oci::Spec) -> bool {
-    if let Some(linux) = spec.linux.as_ref() {
-        for n in linux.namespaces.iter() {
-            if n.r#type.as_str() == oci::PIDNAMESPACE {
-                return !n.path.is_empty();
+    if let Some(linux) = spec.linux().as_ref() {
+        let namespaces = linux.namespaces().clone().unwrap_or_default();
+        for n in namespaces.iter() {
+            if n.typ() == oci::LinuxNamespaceType::Pid {
+                return !n.path().is_none();
             }
         }
     }
@@ -477,25 +664,55 @@ fn is_pid_namespace_enabled(spec: &oci::Spec) -> bool {
 mod tests {
     use super::amend_spec;
     use super::is_pid_namespace_enabled;
+    use super::*;
+    use oci_spec::runtime::LinuxNamespaceType;
+    use oci_spec::runtime::{LinuxBuilder, LinuxNamespaceBuilder};
+
     #[test]
     fn test_amend_spec_disable_guest_seccomp() {
-        let mut spec = oci::Spec {
-            linux: Some(oci::Linux {
-                seccomp: Some(oci::LinuxSeccomp::default()),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
+        let mut spec = oci::Spec::default();
+        let mut linux = oci::Linux::default();
+        linux.set_seccomp(Some(oci::LinuxSeccomp::default()));
+        spec.set_linux(Some(linux));
 
-        assert!(spec.linux.as_ref().unwrap().seccomp.is_some());
+        assert!(spec.linux().as_ref().unwrap().seccomp().is_some());
 
         // disable_guest_seccomp = false
-        amend_spec(&mut spec, false).unwrap();
-        assert!(spec.linux.as_ref().unwrap().seccomp.is_some());
+        amend_spec(&mut spec, false, false).unwrap();
+        assert!(spec.linux().as_ref().unwrap().seccomp().is_some());
 
         // disable_guest_seccomp = true
-        amend_spec(&mut spec, true).unwrap();
-        assert!(spec.linux.as_ref().unwrap().seccomp.is_none());
+        amend_spec(&mut spec, true, false).unwrap();
+        assert!(spec.linux().as_ref().unwrap().seccomp().is_none());
+    }
+
+    #[test]
+    fn test_amend_spec_disable_guest_selinux() {
+        let mut spec = oci::SpecBuilder::default()
+            .process(
+                oci::ProcessBuilder::default()
+                    .selinux_label("xxx".to_owned())
+                    .build()
+                    .unwrap(),
+            )
+            .linux(
+                oci::LinuxBuilder::default()
+                    .mount_label("yyy".to_owned())
+                    .build()
+                    .unwrap(),
+            )
+            .build()
+            .unwrap();
+
+        // disable_guest_selinux = false, selinux labels are left alone
+        amend_spec(&mut spec, false, false).unwrap();
+        assert!(spec.process().as_ref().unwrap().selinux_label() == &Some("xxx".to_owned()));
+        assert!(spec.linux().as_ref().unwrap().mount_label() == &Some("yyy".to_owned()));
+
+        // disable_guest_selinux = true, selinux labels are reset
+        amend_spec(&mut spec, false, true).unwrap();
+        assert!(spec.process().as_ref().unwrap().selinux_label().is_none());
+        assert!(spec.linux().as_ref().unwrap().mount_label().is_none());
     }
 
     #[test]
@@ -509,37 +726,40 @@ mod tests {
         let tests = &[
             TestData {
                 desc: "no pid namespace",
-                namespaces: vec![oci::LinuxNamespace {
-                    r#type: "network".to_string(),
-                    path: "".to_string(),
-                }],
+                namespaces: vec![LinuxNamespaceBuilder::default()
+                    .typ(LinuxNamespaceType::Network)
+                    .path("/dev/null")
+                    .build()
+                    .unwrap()],
                 result: false,
             },
             TestData {
                 desc: "empty pid namespace path",
                 namespaces: vec![
-                    oci::LinuxNamespace {
-                        r#type: "pid".to_string(),
-                        path: "".to_string(),
-                    },
-                    oci::LinuxNamespace {
-                        r#type: "network".to_string(),
-                        path: "".to_string(),
-                    },
+                    LinuxNamespaceBuilder::default()
+                        .typ(LinuxNamespaceType::Network)
+                        .build()
+                        .unwrap(),
+                    LinuxNamespaceBuilder::default()
+                        .typ(LinuxNamespaceType::Pid)
+                        .build()
+                        .unwrap(),
                 ],
                 result: false,
             },
             TestData {
                 desc: "pid namespace is set",
                 namespaces: vec![
-                    oci::LinuxNamespace {
-                        r#type: "pid".to_string(),
-                        path: "/some/path".to_string(),
-                    },
-                    oci::LinuxNamespace {
-                        r#type: "network".to_string(),
-                        path: "".to_string(),
-                    },
+                    LinuxNamespaceBuilder::default()
+                        .typ(LinuxNamespaceType::Network)
+                        .path("/some/path")
+                        .build()
+                        .unwrap(),
+                    LinuxNamespaceBuilder::default()
+                        .typ(LinuxNamespaceType::Pid)
+                        .path("/dev/null")
+                        .build()
+                        .unwrap(),
                 ],
                 result: true,
             },
@@ -548,10 +768,16 @@ mod tests {
         let mut spec = oci::Spec::default();
 
         for (i, d) in tests.iter().enumerate() {
-            spec.linux = Some(oci::Linux {
-                namespaces: d.namespaces.clone(),
-                ..Default::default()
-            });
+            spec.set_linux(Some(
+                LinuxBuilder::default()
+                    .namespaces(d.namespaces.clone())
+                    .build()
+                    .unwrap(),
+            ));
+            // spec.linux = Some(oci::Linux {
+            //     namespaces: d.namespaces.clone(),
+            //     ..Default::default()
+            // });
 
             assert_eq!(
                 d.result,

@@ -8,12 +8,13 @@ use crate::args::{DirectVolSubcommand, DirectVolumeCommand};
 use anyhow::{anyhow, Ok, Result};
 use futures::executor;
 use kata_types::mount::{
-    DirectVolumeMountInfo, KATA_DIRECT_VOLUME_ROOT_PATH, KATA_MOUNT_INFO_FILE_NAME,
+    get_volume_mount_info, join_path, DirectVolumeMountInfo, KATA_DIRECT_VOLUME_ROOT_PATH,
+    KATA_MOUNT_INFO_FILE_NAME,
 };
 use nix;
 use reqwest::StatusCode;
-use safe_path;
-use std::{fs, path::PathBuf, time::Duration};
+use slog::{info, o};
+use std::fs;
 use url;
 
 use agent::ResizeVolumeRequest;
@@ -22,8 +23,15 @@ use shim_interface::shim_mgmt::{
     DIRECT_VOLUME_PATH_KEY, DIRECT_VOLUME_RESIZE_URL, DIRECT_VOLUME_STATS_URL,
 };
 
-const TIMEOUT: Duration = Duration::from_millis(2000);
+use crate::utils::TIMEOUT;
+
 const CONTENT_TYPE_JSON: &str = "application/json";
+
+macro_rules! sl {
+    () => {
+        slog_scope::logger().new(o!("subsystem" => "volume_ops"))
+    };
+}
 
 pub fn handle_direct_volume(vol_cmd: DirectVolumeCommand) -> Result<()> {
     if !nix::unistd::Uid::effective().is_root() {
@@ -41,7 +49,7 @@ pub fn handle_direct_volume(vol_cmd: DirectVolumeCommand) -> Result<()> {
         }
     };
     if let Some(cmd_result) = cmd_result {
-        println!("{:?}", cmd_result);
+        info!(sl!(), "{:?}", cmd_result);
     }
 
     Ok(())
@@ -90,19 +98,9 @@ async fn stats(volume_path: &str) -> Result<Option<String>> {
     Ok(Some(body))
 }
 
-// join_path joins user provided volumepath with kata direct-volume root path
-// the volume_path is base64-encoded and then safely joined to the end of path prefix
-fn join_path(prefix: &str, volume_path: &str) -> Result<PathBuf> {
-    if volume_path.is_empty() {
-        return Err(anyhow!("volume path must not be empty"));
-    }
-    let b64_encoded_path = base64::encode(volume_path.as_bytes());
-
-    Ok(safe_path::scoped_join(prefix, b64_encoded_path)?)
-}
-
 // add writes the mount info (json string) of a direct volume into a filesystem path known to Kata Containers.
 pub fn add(volume_path: &str, mount_info: &str) -> Result<Option<String>> {
+    fs::create_dir_all(KATA_DIRECT_VOLUME_ROOT_PATH)?;
     let mount_info_dir_path = join_path(KATA_DIRECT_VOLUME_ROOT_PATH, volume_path)?;
 
     // create directory if missing
@@ -129,15 +127,6 @@ pub fn remove(volume_path: &str) -> Result<Option<String>> {
     Ok(None)
 }
 
-pub fn get_volume_mount_info(volume_path: &str) -> Result<DirectVolumeMountInfo> {
-    let mount_info_file_path =
-        join_path(KATA_DIRECT_VOLUME_ROOT_PATH, volume_path)?.join(KATA_MOUNT_INFO_FILE_NAME);
-    let mount_info_file = fs::read_to_string(mount_info_file_path)?;
-    let mount_info: DirectVolumeMountInfo = serde_json::from_str(&mount_info_file)?;
-
-    Ok(mount_info)
-}
-
 // get_sandbox_id_for_volume finds the id of the first sandbox found in the dir.
 // We expect a direct-assigned volume is associated with only a sandbox at a time.
 pub fn get_sandbox_id_for_volume(volume_path: &str) -> Result<String> {
@@ -162,7 +151,7 @@ pub fn get_sandbox_id_for_volume(volume_path: &str) -> Result<String> {
         return Ok(String::from(file_name));
     }
 
-    return Err(anyhow!("no sandbox found for {}", volume_path));
+    Err(anyhow!("no sandbox found for {}", volume_path))
 }
 
 #[cfg(test)]
@@ -170,7 +159,7 @@ mod tests {
     use super::*;
     use kata_types::mount::DirectVolumeMountInfo;
     use serial_test::serial;
-    use std::{collections::HashMap, fs};
+    use std::{collections::HashMap, fs, path::PathBuf};
     use tempfile::tempdir;
     use test_utils::skip_if_not_root;
 
@@ -219,17 +208,19 @@ mod tests {
         let root_fs_str = root_fs.to_str().unwrap();
 
         let relative_secret_path = "../../etc/passwd";
-        let b64_relative_secret_path = base64::encode(relative_secret_path);
+        let b64_relative_secret_path =
+            base64::encode_config(relative_secret_path, base64::URL_SAFE);
 
-        // this byte array b64encodes to "/abcdddd"
-        let b64_abs_path = vec![253, 166, 220, 117, 215, 93];
-        let converted_relative_path = "abcdddd";
+        // byte array of "abcdddd"
+        let b64_abs_path = vec![97, 98, 99, 100, 100, 100, 100];
+        // b64urlencoded string of "abcdddd"
+        let b64urlencodes_relative_path = "YWJjZGRkZA==";
 
         let tests = &[
             TestData {
                 rootfs: root_fs_str,
                 volume_path: "",
-                result: Err(anyhow!("volume path must not be empty")),
+                result: Err(anyhow!(std::io::ErrorKind::NotFound)),
             },
             TestData {
                 rootfs: root_fs_str,
@@ -239,14 +230,15 @@ mod tests {
             TestData {
                 rootfs: root_fs_str,
                 volume_path: unsafe { std::str::from_utf8_unchecked(&b64_abs_path) },
-                result: Ok(root_fs.join(converted_relative_path)),
+                result: Ok(root_fs.join(b64urlencodes_relative_path)),
             },
         ];
+
         for (i, d) in tests.iter().enumerate() {
             let msg = format!("test[{}]: {:?}", i, d);
             let result = join_path(d.rootfs, d.volume_path);
             let msg = format!("{}, result: {:?}", msg, result);
-            if d.result.is_ok() {
+            if result.is_ok() {
                 assert!(
                     result.as_ref().unwrap() == d.result.as_ref().unwrap(),
                     "{}",

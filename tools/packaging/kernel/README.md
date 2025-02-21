@@ -8,14 +8,11 @@ automates the process to build a kernel for Kata Containers.
 
 The `build-kernel.sh` script requires an installed Golang version matching the
 [component build requirements](../../../docs/Developer-Guide.md#requirements-to-build-individual-components).
-It also requires [yq](https://github.com/mikefarah/yq) version 3.4.1
-> **Hint**: `snap install yq --channel=v3/stable` \
-> **or** `go install github.com/mikefarah/yq/v3@latest`
+It also requires [yq](https://github.com/mikefarah/yq) version v4.40.7.
+> **Hint**: `go install github.com/mikefarah/yq/v4@latest`
 
 
 The Linux kernel scripts further require a few packages (flex, bison, and libelf-dev)
-See the CI scripts for your distro for more information...
-Look for the setup*.sh files [here](https://github.com/kata-containers/tests/tree/main/.ci)
 
 
 ## Usage
@@ -41,14 +38,15 @@ Commands:
 Options:
 
 	-a <arch>       : Arch target to build the kernel, such as aarch64/ppc64le/s390x/x86_64.
-	-c <path>   	: Path to config file to build the kernel.
-	-d          	: Enable bash debug.
-	-e          	: Enable experimental kernel.
-	-f          	: Enable force generate config when setup.
-	-g <vendor> 	: GPU vendor, intel or nvidia.
-	-h          	: Display this help.
-	-k <path>   	: Path to kernel to build.
-	-p <path>   	: Path to a directory with patches to apply to kernel, only patches in top-level directory are applied.
+	-c <path>       : Path to config file to build the kernel.
+	-d              : Enable bash debug.
+	-e              : Enable experimental kernel.
+	-f              : Enable force generate config when setup.
+	-g <vendor>     : GPU vendor, intel or nvidia.
+	-h              : Display this help.
+  -H <deb|rpm>  : Linux headers for guest fs module building.
+	-k <path>       : Path to kernel to build.
+	-p <path>       : Path to a directory with patches to apply to kernel, only patches in top-level directory are applied.
 	-t <hypervisor>	: Hypervisor_target.
 	-v <version>	: Kernel version to use if kernel path not provided.
 ```
@@ -69,7 +67,7 @@ $ ./build-kernel.sh -v 5.10.25 -g nvidia -f -d setup
 ## Setup kernel source code
 
 ```bash
-$ git clone github.com/kata-containers/kata-containers
+$ git clone https://github.com/kata-containers/kata-containers.git
 $ cd kata-containers/tools/packaging/kernel
 $ ./build-kernel.sh setup
 ```
@@ -171,13 +169,5 @@ In order to do Kata Kernel changes. There are places to contribute:
 - Kernel patches, the CI and packaging scripts will apply all patches in the
   [patches directory][patches-dir].
 
-Note: The kernel version and configuration file live in different locations,
-which could result in a circular dependency on your (runtime or packaging) PR.
-In this case, the PR you submit needs to be tested together with a patch from
-another Kata Containers repository. To do this you have to specify which
-repository and which pull request [it depends on][depends-on-docs].
-
 [kata-containers-versions-file]: ../../../versions.yaml
 [patches-dir]: patches
-[depends-on-docs]: https://github.com/kata-containers/tests/blob/main/README.md#breaking-compatibility
-[cache-job]: http://jenkins.katacontainers.io/job/image-nightly-x86_64/

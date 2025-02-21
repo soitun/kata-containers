@@ -457,7 +457,7 @@ func failOutstandingCommands(cmdQueue *list.List) {
 		cmd := e.Value.(*qmpCommand)
 		select {
 		case cmd.res <- qmpResult{
-			err: errors.New("exitting QMP loop, command cancelled"),
+			err: errors.New("exiting QMP loop, command cancelled"),
 		}:
 		case <-cmd.ctx.Done():
 		}
@@ -626,7 +626,7 @@ func (q *QMP) executeCommandWithResponse(ctx context.Context, name string, args 
 	resCh := make(chan qmpResult)
 	select {
 	case <-q.disconnectedCh:
-		err = errors.New("exitting QMP loop, command cancelled")
+		err = errors.New("exiting QMP loop, command cancelled")
 	case q.cmdCh <- qmpCommand{
 		ctx:    ctx,
 		res:    resCh,
@@ -802,7 +802,12 @@ func (q *QMP) blockdevAddBaseArgs(driver string, blockDevice *BlockDevice) map[s
 // used to name the device.  As this identifier will be passed directly to QMP,
 // it must obey QMP's naming rules, e,g., it must start with a letter.
 func (q *QMP) ExecuteBlockdevAdd(ctx context.Context, blockDevice *BlockDevice) error {
-	args := q.blockdevAddBaseArgs("host_device", blockDevice)
+	var args map[string]interface{}
+	if fi, err := os.Stat(blockDevice.File); err == nil && fi.Mode().IsRegular() {
+		args = q.blockdevAddBaseArgs("file", blockDevice)
+	} else {
+		args = q.blockdevAddBaseArgs("host_device", blockDevice)
+	}
 
 	return q.executeCommand(ctx, "blockdev-add", args, nil)
 }
@@ -864,7 +869,7 @@ func (q *QMP) ExecuteDeviceAdd(ctx context.Context, blockdevID, devID, driver, b
 	}
 
 	if shared {
-		args["share-rw"] = "on"
+		args["share-rw"] = true
 	}
 	if transport.isVirtioPCI(nil) {
 		args["romfile"] = romfile
@@ -918,7 +923,7 @@ func (q *QMP) ExecuteSCSIDeviceAdd(ctx context.Context, blockdevID, devID, drive
 		args["lun"] = lun
 	}
 	if shared {
-		args["share-rw"] = "on"
+		args["share-rw"] = true
 	}
 
 	return q.executeCommand(ctx, "device_add", args, nil)
@@ -1045,7 +1050,7 @@ func (q *QMP) ExecuteNetPCIDeviceAdd(ctx context.Context, netdevID, devID, macAd
 		// Clearlinux automatically sets up the queues properly
 		// The agent implementation should do this to ensure that it is
 		// always set
-		args["mq"] = "on"
+		args["mq"] = true
 		args["vectors"] = 2*queues + 2
 	}
 
@@ -1066,7 +1071,7 @@ func (q *QMP) ExecuteNetCCWDeviceAdd(ctx context.Context, netdevID, devID, macAd
 	}
 
 	if queues > 0 {
-		args["mq"] = "on"
+		args["mq"] = true
 	}
 
 	return q.executeCommand(ctx, "device_add", args, nil)
@@ -1108,7 +1113,7 @@ func (q *QMP) ExecutePCIDeviceAdd(ctx context.Context, blockdevID, devID, driver
 		args["bus"] = bus
 	}
 	if shared {
-		args["share-rw"] = "on"
+		args["share-rw"] = true
 	}
 	if queues > 0 {
 		args["num-queues"] = strconv.Itoa(queues)
@@ -1217,10 +1222,11 @@ func (q *QMP) ExecutePCIVFIOMediatedDeviceAdd(ctx context.Context, devID, sysfsd
 }
 
 // ExecuteAPVFIOMediatedDeviceAdd adds a VFIO mediated AP device to a QEMU instance using the device_add command.
-func (q *QMP) ExecuteAPVFIOMediatedDeviceAdd(ctx context.Context, sysfsdev string) error {
+func (q *QMP) ExecuteAPVFIOMediatedDeviceAdd(ctx context.Context, sysfsdev string, devID string) error {
 	args := map[string]interface{}{
 		"driver":   VfioAP,
 		"sysfsdev": sysfsdev,
+		"id":       devID,
 	}
 	return q.executeCommand(ctx, "device_add", args, nil)
 }

@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2018 Intel Corporation
+# Copyright (c) 2018-2023 Intel Corporation
 #
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -75,7 +75,7 @@ assets:
       url: "https://github.com/cloud-hypervisor/cloud-hypervisor"
       uscan-url: >-
         https://github.com/cloud-hypervisor/cloud-hypervisor/tags.*/v?(\d\S+)\.tar\.gz
-      version: "v30.0"
+      version: "v41.0"
 
     firecracker:
       description: "Firecracker micro-VMM"
@@ -83,13 +83,13 @@ assets:
       uscan-url: >-
         https://github.com/firecracker-microvm/firecracker/tags
         .*/v?(\d\S+)\.tar\.gz
-      version: "v1.3.1"
+      version: "v1.8.0"
 
     qemu:
       description: "VMM that uses KVM"
       url: "https://github.com/qemu/qemu"
-      version: "v7.2.0"
-      tag: "v7.2.0"
+      version: "v9.1.2"
+      tag: "v9.1.2"
       # Do not include any non-full release versions
       # Break the line *without CR or space being appended*, to appease
       # yamllint, and note the deliberate ' ' at the end of the expression.
@@ -98,20 +98,21 @@ assets:
       uscan-url: >-
         https://github.com/qemu/qemu/tags
         .*/v?(\d\S+)\.tar\.gz
-      tdx:
-        description: "VMM that uses KVM and supports TDX"
-        url: "https://github.com/kata-containers/qemu"
-        tag: "TDX-v3.1"
-      snp:
-        description: "VMM that uses KVM and supports AMD SEV-SNP"
-        url: "https://github.com/AMDESE/qemu"
-        branch: "snp-v3"
-        commit: "ffa95097ee"
 
-    qemu-experimental:
-      description: "QEMU with virtiofs support"
-      url: "https://github.com/qemu/qemu"
-      version: "7a800cf9496fddddf71b21a00991e0ec757a170a"
+    qemu-snp-experimental:
+      description: "QEMU with GPU+SNP support"
+      url: "https://github.com/confidential-containers/qemu.git"
+      tag: "gpu-snp-20250211"
+
+    qemu-tdx-experimental:
+      description: "QEMU with GPU+TDX support"
+      url: "https://github.com/confidential-containers/qemu.git"
+      tag: "gpu-tdx-20250211"
+
+    stratovirt:
+      description: "StratoVirt is an lightweight opensource VMM"
+      url: "https://github.com/openeuler-mirror/stratovirt"
+      version: "v2.3.0"
 
   image:
     description: |
@@ -121,18 +122,37 @@ assets:
     architecture:
       aarch64:
         name: "ubuntu"
-        version: "latest"
+        version: "jammy"  # 22.04 LTS
+        nvidia-gpu:
+          name: "ubuntu"
+          version: "jammy"  # 22.04 LTS
+        nvidia-gpu-confidential:
+          name: "ubuntu"
+          version: "jammy"  # 22.04 LTS
       ppc64le:
         name: "ubuntu"
-        version: "latest"
+        version: "jammy"  # 22.04 LTS
       s390x:
         name: "ubuntu"
-        version: "latest"
+        version: "jammy"  # 22.04 LTS
+        confidential:
+          name: "ubuntu"
+          version: "jammy"  # 22.04 LTS
       x86_64:
-        name: &default-image-name "ubuntu"
-        version: "latest"
-    meta:
-      image-type: *default-image-name
+        name: "ubuntu"
+        version: "jammy"  # 22.04 lTS
+        confidential:
+          name: "ubuntu"
+          version: "oracular"  # 24.10
+        mariner:
+          name: "cbl-mariner"
+          version: "3.0"
+        nvidia-gpu:
+          name: "ubuntu"
+          version: "jammy"  # 22.04 LTS
+        nvidia-gpu-confidential:
+          name: "ubuntu"
+          version: "jammy"  # 22.04 LTS
 
   initrd:
     description: |
@@ -141,64 +161,91 @@ assets:
     url: "https://github.com/kata-containers/kata-containers/tools/osbuilder"
     architecture:
       aarch64:
-        name: &default-initrd-name "alpine"
-        version: &default-initrd-version "3.15"
+        name: "alpine"
+        version: "3.18"
+        nvidia-gpu:
+          name: "ubuntu"
+          version: "jammy"  # 22.04 LTS
+        nvidia-gpu-confidential:
+          name: "ubuntu"
+          version: "jammy"
       # Do not use Alpine on ppc64le & s390x, the agent cannot use musl because
       # there is no such Rust target
       ppc64le:
-        name: &glibc-initrd-name "ubuntu"
-        version: &glibc-initrd-version "20.04"
+        name: "ubuntu"
+        version: "jammy"  # 22.04 LTS
       s390x:
-        name: *glibc-initrd-name
-        version: *glibc-initrd-version
+        name: "ubuntu"
+        version: "jammy"  # 22.04 LTS
+        confidential:
+          name: "ubuntu"
+          version: "jammy"  # 22.04 LTS
       x86_64:
-        name: *default-initrd-name
-        version: *default-initrd-version
+        name: "alpine"
+        version: "3.18"
+        confidential:
+          name: "ubuntu"
+          version: "focal"  # 20.04 LTS
+        nvidia-gpu:
+          name: "ubuntu"
+          version: "jammy"  # 22.04 LTS
+        nvidia-gpu-confidential:
+          name: "ubuntu"
+          version: "jammy"  # 22.04 LTS
 
   kernel:
     description: "Linux kernel optimised for virtual machines"
-    url: "https://cdn.kernel.org/pub/linux/kernel/v5.x/"
-    version: "v5.19.2"
-    tdx:
-      description: "Linux kernel that supports TDX"
-      url: "https://github.com/kata-containers/linux/archive/refs/tags"
-      tag: "5.15-plus-TDX"
-    sev:
-      description: "Linux kernel that supports SEV"
-      url: "https://cdn.kernel.org/pub/linux/kernel/v5.x/"
-      version: "v5.19.2"
-    snp:
-      description: "Linux kernel that supports AMD SEV-SNP for VMs"
-      url: "https://cdn.kernel.org/pub/linux/kernel/v5.x/"
-      version: "v5.19.2"
-
-  kernel-experimental:
-    description: "Linux kernel with virtio-fs support"
-    url: "https://cdn.kernel.org/pub/linux/kernel/v5.x/"
-    tag: "v5.13.10"
+    url: "https://cdn.kernel.org/pub/linux/kernel/v6.x/"
+    version: "v6.12.13"
+    confidential:
+      description: "Linux kernel with x86_64 TEEs (SEV, SNP, and TDX) support"
+      url: "https://cdn.kernel.org/pub/linux/kernel/v6.x/"
+      version: "v6.12.13"
 
   kernel-arm-experimental:
     description: "Linux kernel with cpu/mem hotplug support on arm64"
     url: "https://cdn.kernel.org/pub/linux/kernel/v5.x/"
-    version: "v5.15.7"
+    version: "v5.15.138"
 
   kernel-dragonball-experimental:
     description: "Linux kernel with Dragonball VMM optimizations like upcall"
-    url: "https://cdn.kernel.org/pub/linux/kernel/v5.x/"
-    version: "v5.10.25"
+    url: "https://cdn.kernel.org/pub/linux/kernel/v6.x/"
+    version: "v6.1.62"
 
 externals:
   description: "Third-party projects used by the system"
+
+  busybox:
+    desc: "The Swiss Army Knife of Embedded Linux"
+    version: "1.36.1"
+    url: "https://busybox.net/downloads"
+
+  helm:
+    description: "Kubernetes package manager"
+    url: "https://get.helm.sh/"
+    version: "v3.15.2"
 
   cni-plugins:
     description: "CNI network plugins"
     url: "https://github.com/containernetworking/plugins"
     version: "v1.2.0"
 
-  conmon:
-    description: "An OCI container runtime monitor"
-    url: "https://github.com/containers/conmon"
-    version: "v2.0.10"
+  coco-guest-components:
+    description: "Provides attested key unwrapping for image decryption"
+    url: "https://github.com/confidential-containers/guest-components/"
+    version: "514c561d933cb11a0f1628621a0b930157af76cd"
+    toolchain: "1.80.0"
+
+  coco-trustee:
+    description: "Provides attestation and secret delivery components"
+    url: "https://github.com/confidential-containers/trustee"
+    version: "68e2a8d25dbfa012b422ff464f31d18f3afa6677"
+    # image / ita_image and image_tag / ita_image_tag must be in sync
+    image: "ghcr.io/confidential-containers/staged-images/kbs"
+    image_tag: "68e2a8d25dbfa012b422ff464f31d18f3afa6677"
+    ita_image: "ghcr.io/confidential-containers/staged-images/kbs-ita-as"
+    ita_image_tag: "68e2a8d25dbfa012b422ff464f31d18f3afa6677-x86_64"
+    toolchain: "1.76.0"
 
   crio:
     description: |
@@ -215,16 +262,43 @@ externals:
     # instead of abstract socket, thus kata wouldn's support the containerd's
     # version older than them.
     version: "v1.6.8"
+    lts: "v1.6"
+    active: "v1.7"
+    # add containerd 2.0.0 for sandbox api test
+    latest: "v2.0"
 
   critools:
     description: "CLI tool for Container Runtime Interface (CRI)"
     url: "https://github.com/kubernetes-sigs/cri-tools"
     version: "1.23.0"
+    # As we don't want to disrupt what we have on the `tests` repo, let's
+    # create a "latest" entry and use that for the GitHub actions tests.
+    latest: "v1.29"
+
+  runc:
+    description: "CLI tool for spawning and running containers"
+    url: "https://github.com/opencontainers/runc"
+    latest: "v1.2"
+
+  cryptsetup:
+    description: "A utility used to setup disk encryption, integrity protection"
+    url: "https://gitlab.com/cryptsetup/cryptsetup"
+    version: "v2.5.0"
 
   gperf:
     description: "GNU gperf is a perfect hash function generator"
     url: "http://ftp.gnu.org/pub/gnu/gperf/"
     version: "3.1"
+
+  hadolint:
+    description: "the dockerfile linter used by static-checks"
+    url: "https://github.com/hadolint/hadolint"
+    version: "2.12.0"
+
+  lvm2:
+    description: "LVM2 and device-mapper tools and libraries"
+    url: "https://github.com/lvmteam/lvm2"
+    version: "v2_03_16"
 
   kubernetes:
     description: "Kubernetes project container manager"
@@ -236,68 +310,63 @@ externals:
       .*/v?([\d\.]+)\.tar\.gz
     version: "1.23.1-00"
 
+  kustomize:
+    description: "Kubernetes native configuration management"
+    url: "https://github.com/kubernetes-sigs/kustomize"
+    version: "v5.3.0"
+    checksum:
+      amd64: "3ab32f92360d752a2a53e56be073b649abc1e7351b912c0fb32b960d1def854c"
+      arm64: "a1ec622d4adeb483e3cdabd70f0d66058b1e4bcec013c4f74f370666e1e045d8"
+      # yamllint disable-line rule:line-length
+      ppc64le: "946b1aa9325e7234157881fe2098e59c05c6834e56205bf6ec0a9a5fc83c9cc4"
+      s390x: "0b1a00f0e33efa2ecaa6cda9eeb63141ddccf97a912425974d6b65e66cf96cd4"
+
   libseccomp:
     description: "High level interface to Linux seccomp filter"
     url: "https://github.com/seccomp/libseccomp"
-    version: "2.5.4"
+    version: "2.5.5"
 
-  runc:
-    description: "OCI CLI reference runtime implementation"
-    url: "https://github.com/opencontainers/runc"
-    # Oddly, here we do want rc versions, as there appears to be little else
-    # really for runc.
-    uscan-url: >-
-      https://github.com/opencontainers/runc/tags
-      .*/v?(\d\S+)\.tar\.gz
-    version: "v1.1.4"
+  pause:
+    description: "Kubernetes pause container image"
+    repo: "docker://registry.k8s.io/pause"
+    version: "3.9"
 
   nydus:
     description: "Nydus image acceleration service"
     url: "https://github.com/dragonflyoss/image-service"
-    version: "v2.2.0"
+    version: "v2.2.3"
 
   nydus-snapshotter:
     description: "Snapshotter for Nydus image acceleration service"
     url: "https://github.com/containerd/nydus-snapshotter"
-    version: "v0.3.3"
+    version: "v0.13.14"
 
   ovmf:
     description: "Firmware, implementation of UEFI for virtual machines."
     url: "https://github.com/tianocore/edk2"
     x86_64:
       description: "Vanilla firmware build"
-      version: "edk2-stable202202"
+      version: "edk2-stable202411"
       package: "OvmfPkg/OvmfPkgX64.dsc"
       package_output_dir: "OvmfX64"
     sev:
       description: "AmdSev build needed for SEV measured direct boot."
-      version: "edk2-stable202202"
+      version: "edk2-stable202411"
       package: "OvmfPkg/AmdSev/AmdSevX64.dsc"
       package_output_dir: "AmdSev"
-    tdx:
-      url: "https://github.com/tianocore/edk2-staging"
-      description: "TDVF build needed for TDX measured direct boot."
-      version: "2022-tdvf-ww28.5"
-      package: "OvmfPkg/OvmfPkgX64.dsc"
-      package_output_dir: "OvmfX64"
-
-  td-shim:
-    description: "Confidential Containers Shim Firmware"
-    url: "https://github.com/confidential-containers/td-shim"
-    version: "cf9592ef70bd6ba4c7ab1330d278a743f5ba3133"
-    toolchain: "nightly-2022-05-15"
 
   virtiofsd:
     description: "vhost-user virtio-fs device backend written in Rust"
     url: "https://gitlab.com/virtio-fs/virtiofsd"
-    version: "v1.3.0"
-    toolchain: "1.62.0"
-    meta:
-      # From https://gitlab.com/virtio-fs/virtiofsd/-/releases/v1.3.0,
-      # this is the link labelled virtiofsd-v1.3.0.zip
-      #
-      # yamllint disable-line rule:line-length
-      binary: "https://gitlab.com/virtio-fs/virtiofsd/uploads/9a4f2261fcb1701f1e709694b5c5d980/virtiofsd-v1.3.0.zip"
+    # v1.13.0 + seccomp patch allowing the tkill syscall
+    version: "cecc61bca981ab42aae6ec490dfd59965e79025e"
+    toolchain: "1.83.0"
+
+  xurls:
+    description: |
+      Tool used by the CI to check URLs in documents and code comments.
+    url: "mvdan.cc/xurls/v2/cmd/xurls"
+    version: "v2.5.0"
 
 languages:
   description: |
@@ -307,43 +376,33 @@ languages:
   golang:
     description: "Google's 'go' language"
     notes: "'version' is the default minimum version used by this project."
-    version: "1.19.3"
+    version: "1.22.11"
     meta:
       description: |
         'newest-version' is the latest version known to work when
         building Kata
-      newest-version: "1.19.3"
+      newest-version: "1.22.11"
 
   rust:
     description: "Rust language"
     notes: "'version' is the default minimum version used by this project."
-    version: "1.66.0"
+    version: "1.80.0"
     meta:
       description: |
         'newest-version' is the latest version known to work when
         building Kata
-      newest-version: "1.66.0"
+      newest-version: "1.80.0"
 
   golangci-lint:
     description: "golangci-lint"
     notes: "'version' is the default minimum version used by this project."
-    version: "1.50.1"
+    url: "github.com/golangci/golangci-lint"
+    version: "1.57.2"
     meta:
       description: |
         'newest-version' is the latest version known to work when
         building Kata
-      newest-version: "1.50.1"
-
-specs:
-  description: "Details of important specifications"
-
-  oci:
-    description: "Open Containers Initiative runtime specification"
-    url: "https://github.com/opencontainers/runtime-spec/releases"
-    uscan-url: >-
-      https://github.com/opencontainers/runtime-spec/tags
-      .*/v?(\d\S+)\.tar\.gz
-    version: "v1.0.2"
+      newest-version: "1.57.2"
 
 plugins:
   description: |
@@ -356,3 +415,11 @@ plugins:
       available on a Kubernetes host.
     url: "https://github.com/k8snetworkplumbingwg/sriov-network-device-plugin"
     version: "b7f6d3e0679796e907ecca88cfab0e32e326850d"
+
+docker_images:
+  description: "Docker hub images used for testing"
+
+  nginx:
+    description: "Proxy server for HTTP, HTTPS, SMTP, POP3 and IMAP protocols"
+    url: "https://hub.docker.com/_/nginx/"
+    version: "1.15-alpine"

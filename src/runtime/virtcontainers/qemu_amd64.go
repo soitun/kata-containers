@@ -16,6 +16,7 @@ import (
 	"github.com/sirupsen/logrus"
 
 	"github.com/intel-go/cpuid"
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/config"
 	govmmQemu "github.com/kata-containers/kata-containers/src/runtime/pkg/govmm/qemu"
 )
 
@@ -30,6 +31,8 @@ type qemuAmd64 struct {
 	devLoadersCount uint32
 
 	sgxEPCSize int64
+
+	qgsPort uint32
 }
 
 const (
@@ -124,6 +127,7 @@ func newQemuArch(config HypervisorConfig) (qemuArch, error) {
 		},
 		vmFactory: factory,
 		snpGuest:  config.SevSnpGuest,
+		qgsPort:   config.QgsPort,
 	}
 
 	if config.ConfidentialGuest {
@@ -155,16 +159,19 @@ func newQemuArch(config HypervisorConfig) (qemuArch, error) {
 	return q, nil
 }
 
-func (q *qemuAmd64) capabilities() types.Capabilities {
+func (q *qemuAmd64) capabilities(hConfig HypervisorConfig) types.Capabilities {
 	var caps types.Capabilities
 
 	if q.qemuMachine.Type == QemuQ35 ||
 		q.qemuMachine.Type == QemuVirt {
 		caps.SetBlockDeviceHotplugSupport()
+		caps.SetNetworkDeviceHotplugSupported()
 	}
 
 	caps.SetMultiQueueSupport()
-	caps.SetFsSharingSupport()
+	if hConfig.SharedFS != config.NoSharedFS {
+		caps.SetFsSharingSupport()
+	}
 
 	return caps
 }
@@ -233,7 +240,7 @@ func (q *qemuAmd64) enableProtection() error {
 		if q.qemuMachine.Options != "" {
 			q.qemuMachine.Options += ","
 		}
-		q.qemuMachine.Options += "kvm-type=tdx,confidential-guest-support=tdx"
+		q.qemuMachine.Options += "confidential-guest-support=tdx"
 		logger.Info("Enabling TDX guest protection")
 		return nil
 	case sevProtection:
@@ -278,6 +285,7 @@ func (q *qemuAmd64) appendProtectionDevice(devices []govmmQemu.Device, firmware,
 			govmmQemu.Object{
 				Driver:         govmmQemu.Loader,
 				Type:           govmmQemu.TDXGuest,
+				QgsPort:        q.qgsPort,
 				ID:             "tdx",
 				DeviceID:       fmt.Sprintf("fd%d", id),
 				Debug:          false,
@@ -305,6 +313,7 @@ func (q *qemuAmd64) appendProtectionDevice(devices []govmmQemu.Device, firmware,
 				ReducedPhysBits: 1,
 			}), "", nil
 	case noneProtection:
+
 		return devices, firmware, nil
 
 	default:

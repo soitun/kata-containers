@@ -15,6 +15,7 @@ package qemu
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -24,6 +25,8 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/drivers"
 )
 
 // Machine describes the machine type qemu will emulate.
@@ -42,6 +45,12 @@ type Machine struct {
 const (
 	// MachineTypeMicrovm is the QEMU microvm machine type for amd64
 	MachineTypeMicrovm string = "microvm"
+)
+
+const (
+	// Well known vsock CID for host system.
+	// https://man7.org/linux/man-pages/man7/vsock.7.html
+	VsockHostCid uint64 = 2
 )
 
 // Device is the qemu device interface.
@@ -123,6 +132,14 @@ const (
 	// PCIeRootPort is a PCIe Root Port, the PCIe device should be hotplugged to this port.
 	PCIeRootPort DeviceDriver = "pcie-root-port"
 
+	// PCIeSwitchUpstreamPort is a PCIe switch upstream port
+	// A upstream port connects to a PCIe Root Port
+	PCIeSwitchUpstreamPort DeviceDriver = "x3130-upstream"
+
+	// PCIeSwitchDownstreamPort is a PCIe switch downstream port
+	// PCIe devices can be hot-plugged to the downstream port.
+	PCIeSwitchDownstreamPort DeviceDriver = "xio3130-downstream"
+
 	// Loader is the Loader device driver.
 	Loader DeviceDriver = "loader"
 
@@ -155,6 +172,9 @@ const (
 
 	// TransportMMIO is the MMIO transport for virtio devices.
 	TransportMMIO VirtioTransport = "mmio"
+
+	// TransportAP is the AP transport for virtio devices.
+	TransportAP VirtioTransport = "ap"
 )
 
 // defaultTransport returns the default transport for the current combination
@@ -189,6 +209,14 @@ func (transport VirtioTransport) isVirtioCCW(config *Config) bool {
 	}
 
 	return transport == TransportCCW
+}
+
+func (transport VirtioTransport) isVirtioAP(config *Config) bool {
+	if transport == "" {
+		transport = transport.defaultTransport(config)
+	}
+
+	return transport == TransportAP
 }
 
 // getName returns the name of the current transport.
@@ -236,6 +264,7 @@ const (
 
 	// SecExecGuest represents an s390x Secure Execution (Protected Virtualization in QEMU) object
 	SecExecGuest ObjectType = "s390-pv-guest"
+
 	// PEFGuest represent ppc64le PEF(Protected Execution Facility) object.
 	PEFGuest ObjectType = "pef-guest"
 )
@@ -286,6 +315,9 @@ type Object struct {
 
 	// Prealloc enables memory preallocation
 	Prealloc bool
+
+	// QgsPort defines Intel Quote Generation Service port exposed from the host
+	QgsPort uint32
 }
 
 // Valid returns true if the Object structure is valid and complete.
@@ -296,7 +328,7 @@ func (object Object) Valid() bool {
 	case MemoryBackendEPC:
 		return object.ID != "" && object.Size != 0
 	case TDXGuest:
-		return object.ID != "" && object.File != "" && object.DeviceID != ""
+		return object.ID != "" && object.File != "" && object.DeviceID != "" && object.QgsPort != 0
 	case SEVGuest:
 		fallthrough
 	case SNPGuest:
@@ -342,27 +374,22 @@ func (object Object) QemuParams(config *Config) []string {
 		}
 
 	case TDXGuest:
+		objectParams = append(objectParams, prepareTDXObject(object))
+		config.Bios = object.File
+	case SEVGuest:
 		objectParams = append(objectParams, string(object.Type))
 		objectParams = append(objectParams, fmt.Sprintf("id=%s", object.ID))
-		if object.Debug {
-			objectParams = append(objectParams, "debug=on")
-		}
-		deviceParams = append(deviceParams, string(object.Driver))
-		deviceParams = append(deviceParams, fmt.Sprintf("id=%s", object.DeviceID))
-		deviceParams = append(deviceParams, fmt.Sprintf("file=%s", object.File))
-		if object.FirmwareVolume != "" {
-			deviceParams = append(deviceParams, fmt.Sprintf("config-firmware-volume=%s", object.FirmwareVolume))
-		}
-	case SEVGuest:
-		fallthrough
+		objectParams = append(objectParams, fmt.Sprintf("cbitpos=%d", object.CBitPos))
+		objectParams = append(objectParams, fmt.Sprintf("reduced-phys-bits=%d", object.ReducedPhysBits))
+		driveParams = append(driveParams, "if=pflash,format=raw,readonly=on")
+		driveParams = append(driveParams, fmt.Sprintf("file=%s", object.File))
 	case SNPGuest:
 		objectParams = append(objectParams, string(object.Type))
 		objectParams = append(objectParams, fmt.Sprintf("id=%s", object.ID))
 		objectParams = append(objectParams, fmt.Sprintf("cbitpos=%d", object.CBitPos))
 		objectParams = append(objectParams, fmt.Sprintf("reduced-phys-bits=%d", object.ReducedPhysBits))
-
-		driveParams = append(driveParams, "if=pflash,format=raw,readonly=on")
-		driveParams = append(driveParams, fmt.Sprintf("file=%s", object.File))
+		objectParams = append(objectParams, "kernel-hashes=on")
+		config.Bios = object.File
 	case SecExecGuest:
 		objectParams = append(objectParams, string(object.Type))
 		objectParams = append(objectParams, fmt.Sprintf("id=%s", object.ID))
@@ -373,7 +400,6 @@ func (object Object) QemuParams(config *Config) []string {
 		deviceParams = append(deviceParams, string(object.Driver))
 		deviceParams = append(deviceParams, fmt.Sprintf("id=%s", object.DeviceID))
 		deviceParams = append(deviceParams, fmt.Sprintf("host-path=%s", object.File))
-
 	}
 
 	if len(deviceParams) > 0 {
@@ -392,6 +418,62 @@ func (object Object) QemuParams(config *Config) []string {
 	}
 
 	return qemuParams
+}
+
+type SocketAddress struct {
+	Type string `json:"type"`
+	Cid  string `json:"cid"`
+	Port string `json:"port"`
+}
+
+type TdxQomObject struct {
+	QomType               string        `json:"qom-type"`
+	Id                    string        `json:"id"`
+	MrConfigId            string        `json:"mrconfigid,omitempty"`
+	MrOwner               string        `json:"mrowner,omitempty"`
+	MrOwnerConfig         string        `json:"mrownerconfig,omitempty"`
+	QuoteGenerationSocket SocketAddress `json:"quote-generation-socket,omitempty"`
+	Debug                 *bool         `json:"debug,omitempty"`
+}
+
+func (this *SocketAddress) String() string {
+	b, err := json.Marshal(*this)
+
+	if err != nil {
+		log.Fatalf("Unable to marshal SocketAddress object: %s", err.Error())
+		return ""
+	}
+
+	return string(b)
+}
+
+func (this *TdxQomObject) String() string {
+	b, err := json.Marshal(*this)
+
+	if err != nil {
+		log.Fatalf("Unable to marshal TDX QOM object: %s", err.Error())
+		return ""
+	}
+
+	return string(b)
+}
+
+func prepareTDXObject(object Object) string {
+	qgsSocket := SocketAddress{"vsock", fmt.Sprint(VsockHostCid), fmt.Sprint(object.QgsPort)}
+	tdxObject := TdxQomObject{
+		string(object.Type), // qom-type
+		object.ID,           // id
+		"",                  // mrconfigid
+		"",                  // mrowner
+		"",                  // mrownerconfig
+		qgsSocket,           // quote-generation-socket
+		nil}
+
+	if object.Debug {
+		*tdxObject.Debug = true
+	}
+
+	return tdxObject.String()
 }
 
 // Virtio9PMultidev filesystem behaviour to deal
@@ -1218,10 +1300,6 @@ func (blkdev BlockDevice) QemuParams(config *Config) []string {
 		deviceParams = append(deviceParams, s)
 	}
 	deviceParams = append(deviceParams, fmt.Sprintf("drive=%s", blkdev.ID))
-	if !blkdev.SCSI {
-		deviceParams = append(deviceParams, "scsi=off")
-	}
-
 	if !blkdev.WCE {
 		deviceParams = append(deviceParams, "config-wce=off")
 	}
@@ -1330,15 +1408,14 @@ func (dev LoaderDevice) QemuParams(config *Config) []string {
 // in to the guest
 // nolint: govet
 type VhostUserDevice struct {
-	SocketPath     string //path to vhostuser socket on host
-	CharDevID      string
-	TypeDevID      string //variable QEMU parameter based on value of VhostUserType
-	Address        string //used for MAC address in net case
-	Tag            string //virtio-fs volume id for mounting inside guest
-	CacheSize      uint32 //virtio-fs DAX cache size in MiB
-	QueueSize      uint32 //size of virtqueues
-	SharedVersions bool   //enable virtio-fs shared version metadata
-	VhostUserType  DeviceDriver
+	SocketPath    string //path to vhostuser socket on host
+	CharDevID     string
+	TypeDevID     string //variable QEMU parameter based on value of VhostUserType
+	Address       string //used for MAC address in net case
+	Tag           string //virtio-fs volume id for mounting inside guest
+	CacheSize     uint32 //virtio-fs DAX cache size in MiB
+	QueueSize     uint32 //size of virtqueues
+	VhostUserType DeviceDriver
 
 	// ROMFile specifies the ROM file being used for this device.
 	ROMFile string
@@ -1512,9 +1589,6 @@ func (vhostuserDev VhostUserDevice) QemuFSParams(config *Config) []string {
 	if vhostuserDev.CacheSize != 0 {
 		deviceParams = append(deviceParams, fmt.Sprintf("cache-size=%dM", vhostuserDev.CacheSize))
 	}
-	if vhostuserDev.SharedVersions {
-		deviceParams = append(deviceParams, "versiontable=/dev/shm/fuse_shared_versions")
-	}
 	if vhostuserDev.Transport.isVirtioCCW(config) {
 		if config.Knobs.IOMMUPlatform {
 			deviceParams = append(deviceParams, "iommu_platform=on")
@@ -1685,8 +1759,111 @@ func (b PCIeRootPortDevice) Valid() bool {
 	return true
 }
 
+// PCIeSwitchUpstreamPortDevice is the port connecting to the root port
+type PCIeSwitchUpstreamPortDevice struct {
+	ID  string // format: sup{n}, n>=0
+	Bus string // default is rp0
+}
+
+// QemuParams returns the qemu parameters built out of the PCIeSwitchUpstreamPortDevice.
+func (b PCIeSwitchUpstreamPortDevice) QemuParams(config *Config) []string {
+	var qemuParams []string
+	var deviceParams []string
+
+	driver := PCIeSwitchUpstreamPort
+
+	deviceParams = append(deviceParams, fmt.Sprintf("%s,id=%s", driver, b.ID))
+	deviceParams = append(deviceParams, fmt.Sprintf("bus=%s", b.Bus))
+
+	qemuParams = append(qemuParams, "-device")
+	qemuParams = append(qemuParams, strings.Join(deviceParams, ","))
+	return qemuParams
+}
+
+// Valid returns true if the PCIeSwitchUpstreamPortDevice structure is valid and complete.
+func (b PCIeSwitchUpstreamPortDevice) Valid() bool {
+	if b.ID == "" {
+		return false
+	}
+	if b.Bus == "" {
+		return false
+	}
+	return true
+}
+
+// PCIeSwitchDownstreamPortDevice is the port connecting to the root port
+type PCIeSwitchDownstreamPortDevice struct {
+	ID      string // format: sup{n}, n>=0
+	Bus     string // default is rp0
+	Chassis string // (slot, chassis) pair is mandatory and must be unique for each downstream port, >=0, default is 0x00
+	Slot    string // >=0, default is 0x00
+	// This to work needs patches to QEMU
+	BusReserve string
+	// Pref64 and Pref32 are not allowed to be set simultaneously
+	Pref64Reserve string // reserve prefetched MMIO aperture, 64-bit
+	Pref32Reserve string // reserve prefetched MMIO aperture, 32-bit
+	MemReserve    string // reserve non-prefetched MMIO aperture, 32-bit *only*
+	IOReserve     string // IO reservation
+
+}
+
+// QemuParams returns the qemu parameters built out of the PCIeSwitchUpstreamPortDevice.
+func (b PCIeSwitchDownstreamPortDevice) QemuParams(config *Config) []string {
+	var qemuParams []string
+	var deviceParams []string
+	driver := PCIeSwitchDownstreamPort
+
+	deviceParams = append(deviceParams, fmt.Sprintf("%s,id=%s", driver, b.ID))
+	deviceParams = append(deviceParams, fmt.Sprintf("bus=%s", b.Bus))
+	deviceParams = append(deviceParams, fmt.Sprintf("chassis=%s", b.Chassis))
+	deviceParams = append(deviceParams, fmt.Sprintf("slot=%s", b.Slot))
+	if b.BusReserve != "" {
+		deviceParams = append(deviceParams, fmt.Sprintf("bus-reserve=%s", b.BusReserve))
+	}
+
+	if b.Pref64Reserve != "" {
+		deviceParams = append(deviceParams, fmt.Sprintf("pref64-reserve=%s", b.Pref64Reserve))
+	}
+
+	if b.Pref32Reserve != "" {
+		deviceParams = append(deviceParams, fmt.Sprintf("pref32-reserve=%s", b.Pref32Reserve))
+	}
+
+	if b.MemReserve != "" {
+		deviceParams = append(deviceParams, fmt.Sprintf("mem-reserve=%s", b.MemReserve))
+	}
+
+	if b.IOReserve != "" {
+		deviceParams = append(deviceParams, fmt.Sprintf("io-reserve=%s", b.IOReserve))
+	}
+
+	qemuParams = append(qemuParams, "-device")
+	qemuParams = append(qemuParams, strings.Join(deviceParams, ","))
+	return qemuParams
+}
+
+// Valid returns true if the PCIeSwitchUpstremPortDevice structure is valid and complete.
+func (b PCIeSwitchDownstreamPortDevice) Valid() bool {
+	if b.ID == "" {
+		return false
+	}
+	if b.Bus == "" {
+		return false
+	}
+	if b.Chassis == "" {
+		return false
+	}
+	if b.Slot == "" {
+		return false
+	}
+	return true
+}
+
 // VFIODevice represents a qemu vfio device meant for direct access by guest OS.
 type VFIODevice struct {
+	// ID index of the vfio device in devfs or sysfs used for IOMMUFD
+	ID string
+
 	// Bus-Device-Function of device
 	BDF string
 
@@ -1707,6 +1884,12 @@ type VFIODevice struct {
 
 	// Transport is the virtio transport for this device.
 	Transport VirtioTransport
+
+	// SysfsDev specifies the sysfs matrix entry for the AP device
+	SysfsDev string
+
+	// DevfsDev is used to identify a VFIO Group device or IOMMMUFD VFIO device
+	DevfsDev string
 }
 
 // VFIODeviceTransport is a map of the vfio device name that corresponds to
@@ -1715,11 +1898,13 @@ var VFIODeviceTransport = map[VirtioTransport]string{
 	TransportPCI:  "vfio-pci",
 	TransportCCW:  "vfio-ccw",
 	TransportMMIO: "vfio-device",
+	TransportAP:   "vfio-ap",
 }
 
 // Valid returns true if the VFIODevice structure is valid and complete.
+// s390x architecture requires SysfsDev to be set.
 func (vfioDev VFIODevice) Valid() bool {
-	return vfioDev.BDF != ""
+	return vfioDev.BDF != "" || vfioDev.SysfsDev != ""
 }
 
 // QemuParams returns the qemu parameters built out of this vfio device.
@@ -1728,6 +1913,15 @@ func (vfioDev VFIODevice) QemuParams(config *Config) []string {
 	var deviceParams []string
 
 	driver := vfioDev.deviceName(config)
+
+	if vfioDev.Transport.isVirtioAP(config) {
+		deviceParams = append(deviceParams, fmt.Sprintf("%s,sysfsdev=%s", driver, vfioDev.SysfsDev))
+
+		qemuParams = append(qemuParams, "-device")
+		qemuParams = append(qemuParams, strings.Join(deviceParams, ","))
+
+		return qemuParams
+	}
 
 	deviceParams = append(deviceParams, fmt.Sprintf("%s,host=%s", driver, vfioDev.BDF))
 	if vfioDev.Transport.isVirtioPCI(config) {
@@ -1748,6 +1942,12 @@ func (vfioDev VFIODevice) QemuParams(config *Config) []string {
 
 	if vfioDev.Transport.isVirtioCCW(config) {
 		deviceParams = append(deviceParams, fmt.Sprintf("devno=%s", vfioDev.DevNo))
+	}
+
+	if strings.HasPrefix(vfioDev.DevfsDev, drivers.IommufdDevPath) {
+		qemuParams = append(qemuParams, "-object")
+		qemuParams = append(qemuParams, fmt.Sprintf("iommufd,id=iommufd%s", vfioDev.ID))
+		deviceParams = append(deviceParams, fmt.Sprintf("iommufd=iommufd%s", vfioDev.ID))
 	}
 
 	qemuParams = append(qemuParams, "-device")
@@ -2335,14 +2535,28 @@ const (
 	Unix QMPSocketType = "unix"
 )
 
-// QMPSocket represents a qemu QMP socket configuration.
+// MonitorProtocol tells what protocol is used on a QMPSocket
+type MonitorProtocol string
+
+const (
+	// Socket using a human-friendly text-based protocol.
+	Hmp MonitorProtocol = "hmp"
+
+	// Socket using a richer json-based protocol.
+	Qmp MonitorProtocol = "qmp"
+
+	// Same as Qmp with pretty json formatting.
+	QmpPretty MonitorProtocol = "qmp-pretty"
+)
+
+// QMPSocket represents a qemu QMP or HMP socket configuration.
 // nolint: govet
 type QMPSocket struct {
 	// Type is the socket type (e.g. "unix").
 	Type QMPSocketType
 
-	// Human Monitor Interface (HMP) (true for HMP, false for QMP, default false)
-	IsHmp bool
+	// Protocol is the protocol to be used on the socket.
+	Protocol MonitorProtocol
 
 	// QMP listener file descriptor to be passed to qemu
 	FD *os.File
@@ -2365,6 +2579,10 @@ func (qmp QMPSocket) Valid() bool {
 	}
 
 	if qmp.Type != Unix {
+		return false
+	}
+
+	if qmp.Protocol != Hmp && qmp.Protocol != Qmp && qmp.Protocol != QmpPretty {
 		return false
 	}
 
@@ -2483,9 +2701,6 @@ type Knobs struct {
 	// NoGraphic completely disables graphic output.
 	NoGraphic bool
 
-	// Daemonize will turn the qemu process into a daemon
-	Daemonize bool
-
 	// Both HugePages and MemPrealloc require the Memory.Size of the VM
 	// to be set, as they need to reserve the memory upfront in order
 	// for the VM to boot without errors.
@@ -2515,9 +2730,6 @@ type Knobs struct {
 	// Exit instead of rebooting
 	// Prevents QEMU from rebooting in the event of a Triple Fault.
 	NoReboot bool
-
-	// Don’t exit QEMU on guest shutdown, but instead only stop the emulation.
-	NoShutdown bool
 
 	// IOMMUPlatform will enable IOMMU for supported devices
 	IOMMUPlatform bool
@@ -2629,6 +2841,8 @@ type Config struct {
 	PidFile string
 
 	qemuParams []string
+
+	Debug bool
 }
 
 // appendFDs appends a list of arbitrary file descriptors to the qemu configuration and
@@ -2665,8 +2879,15 @@ func (config *Config) appendSeccompSandbox() {
 
 func (config *Config) appendName() {
 	if config.Name != "" {
+		var nameParams []string
+		nameParams = append(nameParams, config.Name)
+
+		if config.Debug {
+			nameParams = append(nameParams, "debug-threads=on")
+		}
+
 		config.qemuParams = append(config.qemuParams, "-name")
-		config.qemuParams = append(config.qemuParams, config.Name)
+		config.qemuParams = append(config.qemuParams, strings.Join(nameParams, ","))
 	}
 }
 
@@ -2716,10 +2937,11 @@ func (config *Config) appendQMPSockets() {
 			}
 		}
 
-		if q.IsHmp {
+		switch q.Protocol {
+		case Hmp:
 			config.qemuParams = append(config.qemuParams, "-monitor")
-		} else {
-			config.qemuParams = append(config.qemuParams, "-qmp")
+		default:
+			config.qemuParams = append(config.qemuParams, fmt.Sprintf("-%s", q.Protocol))
 		}
 
 		config.qemuParams = append(config.qemuParams, strings.Join(qmpParams, ","))
@@ -2733,10 +2955,9 @@ func (config *Config) appendDevices(logger QMPLog) {
 
 	for _, d := range config.Devices {
 		if !d.Valid() {
-			logger.Errorf("vm device is not valid: %+v", config.Devices)
+			logger.Errorf("vm device is not valid: %+v", d)
 			continue
 		}
-
 		config.qemuParams = append(config.qemuParams, d.QemuParams(config)...)
 	}
 }
@@ -2909,14 +3130,6 @@ func (config *Config) appendKnobs() {
 
 	if config.Knobs.NoReboot {
 		config.qemuParams = append(config.qemuParams, "--no-reboot")
-	}
-
-	if config.Knobs.NoShutdown {
-		config.qemuParams = append(config.qemuParams, "--no-shutdown")
-	}
-
-	if config.Knobs.Daemonize {
-		config.qemuParams = append(config.qemuParams, "-daemonize")
 	}
 
 	config.appendMemoryKnobs()

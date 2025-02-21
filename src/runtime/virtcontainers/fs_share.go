@@ -21,8 +21,9 @@ var fsShareTracingTags = map[string]string{
 // SharedFile represents the outcome of a host filesystem sharing
 // operation.
 type SharedFile struct {
-	storage   *grpc.Storage
-	guestPath string
+	containerStorages []*grpc.Storage
+	volumeStorages    []*grpc.Storage
+	guestPath         string
 }
 
 type FilesystemSharer interface {
@@ -74,4 +75,12 @@ type FilesystemSharer interface {
 	// UnshareRootFilesystem stops sharing a container bundle
 	// rootfs.
 	UnshareRootFilesystem(context.Context, *Container) error
+
+	// startFileEventWatcher is the event loop to detect changes in
+	// specific volumes - configmap, secrets, downward-api, projected-volumes
+	// and copy the changes to the guest
+	StartFileEventWatcher(context.Context) error
+
+	// Stops the event loop for file watcher
+	StopFileEventWatcher(context.Context)
 }

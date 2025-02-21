@@ -5,6 +5,8 @@
 
 package hypervisors
 
+import "github.com/kata-containers/kata-containers/src/runtime/pkg/device/config"
+
 // Bridge is a bridge where devices can be hot plugged
 type Bridge struct {
 	// DeviceAddr contains information about devices plugged and its address in the bridge
@@ -28,8 +30,7 @@ type CPUDevice struct {
 
 type HypervisorState struct {
 	BlockIndexMap map[int]struct{}
-
-	// Type of hypervisor, E.g. qemu/firecracker/acrn.
+	// Type of hypervisor, E.g. qemu/firecracker
 	Type string
 	UUID string
 	// clh sepcific: refer to 'virtcontainers/clh.go:CloudHypervisorState'
@@ -44,7 +45,8 @@ type HypervisorState struct {
 	HotpluggedMemory  int
 	VirtiofsDaemonPid int
 	Pid               int
-	PCIeRootPort      int
-
-	HotplugVFIOOnRootBus bool
+	HotPlugVFIO       config.PCIePort
+	ColdPlugVFIO      config.PCIePort
+	PCIeRootPort      uint32
+	PCIeSwitchPort    uint32
 }

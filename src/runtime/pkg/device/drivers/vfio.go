@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 
 	"github.com/sirupsen/logrus"
@@ -23,18 +22,13 @@ import (
 
 // bind/unbind paths to aid in SRIOV VF bring-up/restore
 const (
-	pciDriverUnbindPath = "/sys/bus/pci/devices/%s/driver/unbind"
-	pciDriverBindPath   = "/sys/bus/pci/drivers/%s/bind"
-	vfioNewIDPath       = "/sys/bus/pci/drivers/vfio-pci/new_id"
-	vfioRemoveIDPath    = "/sys/bus/pci/drivers/vfio-pci/remove_id"
-	iommuGroupPath      = "/sys/bus/pci/devices/%s/iommu_group"
-	vfioDevPath         = "/dev/vfio/%s"
-	pcieRootPortPrefix  = "rp"
-	vfioAPSysfsDir      = "/sys/devices/vfio_ap"
-)
-
-var (
-	AllPCIeDevs = map[string]bool{}
+	pciDriverUnbindPath   = "/sys/bus/pci/devices/%s/driver/unbind"
+	pciDriverOverridePath = "/sys/bus/pci/devices/%s/driver_override"
+	driversProbePath      = "/sys/bus/pci/drivers_probe"
+	iommuGroupPath        = "/sys/bus/pci/devices/%s/iommu_group"
+	vfioDevPath           = "/dev/vfio/%s"
+	vfioAPSysfsDir        = "/sys/devices/vfio_ap"
+	IommufdDevPath        = "/dev/vfio/devices"
 )
 
 // VFIODevice is a vfio device meant to be passed to the hypervisor
@@ -71,57 +65,38 @@ func (device *VFIODevice) Attach(ctx context.Context, devReceiver api.DeviceRece
 		}
 	}()
 
-	vfioGroup := filepath.Base(device.DeviceInfo.HostPath)
-	iommuDevicesPath := filepath.Join(config.SysIOMMUPath, vfioGroup, "devices")
-
-	deviceFiles, err := os.ReadDir(iommuDevicesPath)
-	if err != nil {
-		return err
-	}
-
-	// Pass all devices in iommu group
-	for i, deviceFile := range deviceFiles {
-		//Get bdf of device eg 0000:00:1c.0
-		deviceBDF, deviceSysfsDev, vfioDeviceType, err := getVFIODetails(deviceFile.Name(), iommuDevicesPath)
+	// This work for IOMMUFD enabled kernels > 6.x
+	// In the case of IOMMUFD the device.HostPath will look like
+	// /dev/vfio/devices/vfio0
+	// (1) Check if we have the new IOMMUFD or old container based VFIO
+	if strings.HasPrefix(device.DeviceInfo.HostPath, IommufdDevPath) {
+		device.VfioDevs, err = GetDeviceFromVFIODev(*device.DeviceInfo)
 		if err != nil {
 			return err
 		}
-		id := utils.MakeNameID("vfio", device.DeviceInfo.ID+strconv.Itoa(i), maxDevIDSize)
-
-		var vfio config.VFIODev
-
-		switch vfioDeviceType {
-		case config.VFIOPCIDeviceNormalType, config.VFIOPCIDeviceMediatedType:
-			isPCIe := isPCIeDevice(deviceBDF)
-			// Do not directly assign to `vfio` -- need to access field still
-			vfioPCI := config.VFIOPCIDev{
-				ID:       id,
-				Type:     vfioDeviceType,
-				BDF:      deviceBDF,
-				SysfsDev: deviceSysfsDev,
-				IsPCIe:   isPCIe,
-				Class:    getPCIDeviceProperty(deviceBDF, PCISysFsDevicesClass),
-			}
-			if isPCIe {
-				vfioPCI.Bus = fmt.Sprintf("%s%d", pcieRootPortPrefix, len(AllPCIeDevs))
-				AllPCIeDevs[deviceBDF] = true
-			}
-			vfio = vfioPCI
-		case config.VFIOAPDeviceMediatedType:
-			devices, err := GetAPVFIODevices(deviceSysfsDev)
-			if err != nil {
-				return err
-			}
-			vfio = config.VFIOAPDev{
-				ID:        id,
-				SysfsDev:  deviceSysfsDev,
-				Type:      config.VFIOAPDeviceMediatedType,
-				APDevices: devices,
-			}
-		default:
-			return fmt.Errorf("Failed to append device: VFIO device type unrecognized")
+	} else {
+		// Once we have
+		device.VfioDevs, err = GetAllVFIODevicesFromIOMMUGroup(*device.DeviceInfo)
+		if err != nil {
+			return err
 		}
-		device.VfioDevs = append(device.VfioDevs, &vfio)
+	}
+
+	for _, vfio := range device.VfioDevs {
+		// If vfio.Port is not set we bail out, users should set
+		// explicitly the port in the config file
+		if vfio.Port == "" {
+			return fmt.Errorf("cold_plug_vfio= or hot_plug_vfio= port is not set for device %s (BridgePort | RootPort | SwitchPort)", vfio.BDF)
+		}
+
+		if vfio.IsPCIe {
+			busIndex := len(config.PCIeDevicesPerPort[vfio.Port])
+			vfio.Bus = fmt.Sprintf("%s%d", config.PCIePortPrefixMapping[vfio.Port], busIndex)
+			// We need to keep track the number of devices per port to deduce
+			// the corectu bus number, additionally we can use the VFIO device
+			// info to act upon different Vendor IDs and Device IDs.
+			config.PCIeDevicesPerPort[vfio.Port] = append(config.PCIeDevicesPerPort[vfio.Port], *vfio)
+		}
 	}
 
 	coldPlug := device.DeviceInfo.ColdPlug
@@ -178,6 +153,16 @@ func (device *VFIODevice) Detach(ctx context.Context, devReceiver api.DeviceRece
 		deviceLogger().WithError(err).Error("Failed to remove device")
 		return err
 	}
+	for _, vfio := range device.VfioDevs {
+		if vfio.IsPCIe {
+			for ix, dev := range config.PCIeDevicesPerPort[vfio.Port] {
+				if dev.BDF == vfio.BDF {
+					config.PCIeDevicesPerPort[vfio.Port] = append(config.PCIeDevicesPerPort[vfio.Port][:ix], config.PCIeDevicesPerPort[vfio.Port][ix+1:]...)
+					break
+				}
+			}
+		}
+	}
 
 	deviceLogger().WithFields(logrus.Fields{
 		"device-group": device.DeviceInfo.HostPath,
@@ -218,23 +203,18 @@ func (device *VFIODevice) Load(ds config.DeviceState) {
 	for _, dev := range ds.VFIODevs {
 		var vfio config.VFIODev
 
-		vfioDeviceType := (*device.VfioDevs[0]).GetType()
-		switch vfioDeviceType {
+		switch dev.Type {
 		case config.VFIOPCIDeviceNormalType, config.VFIOPCIDeviceMediatedType:
-			bdf := ""
-			if pciDev, ok := (*dev).(config.VFIOPCIDev); ok {
-				bdf = pciDev.BDF
-			}
-			vfio = config.VFIOPCIDev{
-				ID:       *(*dev).GetID(),
-				Type:     config.VFIODeviceType((*dev).GetType()),
-				BDF:      bdf,
-				SysfsDev: *(*dev).GetSysfsDev(),
+			vfio = config.VFIODev{
+				ID:       dev.ID,
+				Type:     config.VFIODeviceType(dev.Type),
+				BDF:      dev.BDF,
+				SysfsDev: dev.SysfsDev,
 			}
 		case config.VFIOAPDeviceMediatedType:
-			vfio = config.VFIOAPDev{
-				ID:       *(*dev).GetID(),
-				SysfsDev: *(*dev).GetSysfsDev(),
+			vfio = config.VFIODev{
+				ID:       dev.ID,
+				SysfsDev: dev.SysfsDev,
 			}
 		default:
 			deviceLogger().WithError(
@@ -249,7 +229,7 @@ func (device *VFIODevice) Load(ds config.DeviceState) {
 
 // It should implement GetAttachCount() and DeviceID() as api.Device implementation
 // here it shares function from *GenericDevice so we don't need duplicate codes
-func getVFIODetails(deviceFileName, iommuDevicesPath string) (deviceBDF, deviceSysfsDev string, vfioDeviceType config.VFIODeviceType, err error) {
+func GetVFIODetails(deviceFileName, iommuDevicesPath string) (deviceBDF, deviceSysfsDev string, vfioDeviceType config.VFIODeviceType, err error) {
 	sysfsDevStr := filepath.Join(iommuDevicesPath, deviceFileName)
 	vfioDeviceType, err = GetVFIODeviceType(sysfsDevStr)
 	if err != nil {
@@ -259,14 +239,18 @@ func getVFIODetails(deviceFileName, iommuDevicesPath string) (deviceBDF, deviceS
 	switch vfioDeviceType {
 	case config.VFIOPCIDeviceNormalType:
 		// Get bdf of device eg. 0000:00:1c.0
-		deviceBDF = getBDF(deviceFileName)
+		// OLD IMPL: deviceBDF = getBDF(deviceFileName)
+		// The old implementation did not consider the case where
+		// vfio devices are located on different root busses. The
+		// kata-agent will handle the case now, here, use the full PCI addr
+		deviceBDF = deviceFileName
 		// Get sysfs path used by cloud-hypervisor
 		deviceSysfsDev = filepath.Join(config.SysBusPciDevicesPath, deviceFileName)
 	case config.VFIOPCIDeviceMediatedType:
 		// Get sysfsdev of device eg. /sys/devices/pci0000:00/0000:00:02.0/f79944e4-5a3d-11e8-99ce-479cbab002e4
 		sysfsDevStr := filepath.Join(iommuDevicesPath, deviceFileName)
 		deviceSysfsDev, err = GetSysfsDev(sysfsDevStr)
-		deviceBDF = getBDF(getMediatedBDF(deviceSysfsDev))
+		deviceBDF = GetBDF(getMediatedBDF(deviceSysfsDev))
 	case config.VFIOAPDeviceMediatedType:
 		sysfsDevStr := filepath.Join(iommuDevicesPath, deviceFileName)
 		deviceSysfsDev, err = GetSysfsDev(sysfsDevStr)
@@ -289,7 +273,7 @@ func getMediatedBDF(deviceSysfsDev string) string {
 
 // getBDF returns the BDF of pci device
 // Expected input string format is [<domain>]:[<bus>][<slot>].[<func>] eg. 0000:02:10.0
-func getBDF(deviceSysStr string) string {
+func GetBDF(deviceSysStr string) string {
 	tokens := strings.SplitN(deviceSysStr, ":", 2)
 	if len(tokens) == 1 {
 		return ""
@@ -297,42 +281,8 @@ func getBDF(deviceSysStr string) string {
 	return tokens[1]
 }
 
-// BindDevicetoVFIO binds the device to vfio driver after unbinding from host.
-// Will be called by a network interface or a generic pcie device.
-func BindDevicetoVFIO(bdf, hostDriver, vendorDeviceID string) (string, error) {
-
-	// Unbind from the host driver
-	unbindDriverPath := fmt.Sprintf(pciDriverUnbindPath, bdf)
-	deviceLogger().WithFields(logrus.Fields{
-		"device-bdf":  bdf,
-		"driver-path": unbindDriverPath,
-	}).Info("Unbinding device from driver")
-
-	if err := utils.WriteToFile(unbindDriverPath, []byte(bdf)); err != nil {
-		return "", err
-	}
-
-	// Add device id to vfio driver.
-	deviceLogger().WithFields(logrus.Fields{
-		"vendor-device-id": vendorDeviceID,
-		"vfio-new-id-path": vfioNewIDPath,
-	}).Info("Writing vendor-device-id to vfio new-id path")
-
-	if err := utils.WriteToFile(vfioNewIDPath, []byte(vendorDeviceID)); err != nil {
-		return "", err
-	}
-
-	// Bind to vfio-pci driver.
-	bindDriverPath := fmt.Sprintf(pciDriverBindPath, "vfio-pci")
-
-	api.DeviceLogger().WithFields(logrus.Fields{
-		"device-bdf":  bdf,
-		"driver-path": bindDriverPath,
-	}).Info("Binding device to vfio driver")
-
-	// Device may be already bound at this time because of earlier write to new_id, ignore error
-	utils.WriteToFile(bindDriverPath, []byte(bdf))
-
+func GetVFIODevPath(bdf string) (string, error) {
+	// Determine the iommu group that the device belongs to.
 	groupPath, err := os.Readlink(fmt.Sprintf(iommuGroupPath, bdf))
 	if err != nil {
 		return "", err
@@ -341,11 +291,66 @@ func BindDevicetoVFIO(bdf, hostDriver, vendorDeviceID string) (string, error) {
 	return fmt.Sprintf(vfioDevPath, filepath.Base(groupPath)), nil
 }
 
-// BindDevicetoHost binds the device to the host driver after unbinding from vfio-pci.
-func BindDevicetoHost(bdf, hostDriver, vendorDeviceID string) error {
-	// Unbind from vfio-pci driver
+// BindDevicetoVFIO binds the device to vfio driver after unbinding from host
+// driver if present.
+// Will be called by a network interface or a generic pcie device.
+func BindDevicetoVFIO(bdf, hostDriver string) (string, error) {
+
+	overrideDriverPath := fmt.Sprintf(pciDriverOverridePath, bdf)
+	deviceLogger().WithFields(logrus.Fields{
+		"device-bdf":           bdf,
+		"driver-override-path": overrideDriverPath,
+	}).Info("Write vfio-pci to driver_override")
+
+	// Write vfio-pci to driver_override file to allow the device to bind to vfio-pci
+	// Reference: https://www.kernel.org/doc/Documentation/ABI/testing/sysfs-bus-platform
+	if err := utils.WriteToFile(overrideDriverPath, []byte("vfio-pci")); err != nil {
+		return "", err
+	}
+
 	unbindDriverPath := fmt.Sprintf(pciDriverUnbindPath, bdf)
+	deviceLogger().WithFields(logrus.Fields{
+		"device-bdf":  bdf,
+		"driver-path": unbindDriverPath,
+	}).Info("Unbinding device from driver")
+
+	// Unbind device from the host driver. In some cases, a driver may not be bound
+	// to the device, in which case this step may fail. Hence ignore error for this step.
+	utils.WriteToFile(unbindDriverPath, []byte(bdf))
+
+	deviceLogger().WithFields(logrus.Fields{
+		"device-bdf":         bdf,
+		"drivers-probe-path": driversProbePath,
+	}).Info("Writing bdf to drivers-probe-path")
+
+	// Invoke drivers_probe so that the driver matching driver_override, in our case
+	// the vfio-pci driver will probe the device.
+	if err := utils.WriteToFile(driversProbePath, []byte(bdf)); err != nil {
+		return "", err
+	}
+
+	return GetVFIODevPath(bdf)
+}
+
+// BindDevicetoHost unbinds the device from vfio-pci driver and binds it to the
+// previously bound driver.
+func BindDevicetoHost(bdf, hostDriver string) error {
+	overrideDriverPath := fmt.Sprintf(pciDriverOverridePath, bdf)
 	api.DeviceLogger().WithFields(logrus.Fields{
+		"device-bdf":           bdf,
+		"driver-override-path": overrideDriverPath,
+	}).Infof("Write %s to driver_override", hostDriver)
+
+	// write previously bound host driver to driver_override to allow the
+	// device to bind to it. This could be empty which means the device will not be
+	// bound to any driver later on.
+	if err := utils.WriteToFile(overrideDriverPath, []byte(hostDriver)); err != nil {
+		return err
+	}
+
+	// Unbind device from vfio-pci driver.
+	unbindDriverPath := fmt.Sprintf(pciDriverUnbindPath, bdf)
+	deviceLogger().WithFields(logrus.Fields{
 		"device-bdf":  bdf,
 		"driver-path": unbindDriverPath,
 	}).Info("Unbinding device from driver")
@@ -354,17 +359,12 @@ func BindDevicetoHost(bdf, hostDriver, vendorDeviceID string) error {
 		return err
 	}
 
-	// To prevent new VFs from binding to VFIO-PCI, remove_id
-	if err := utils.WriteToFile(vfioRemoveIDPath, []byte(vendorDeviceID)); err != nil {
-		return err
-	}
+	deviceLogger().WithFields(logrus.Fields{
+		"device-bdf":         bdf,
+		"drivers-probe-path": driversProbePath,
+	}).Info("Writing bdf to drivers-probe-path")
 
-	// Bind back to host driver
-	bindDriverPath := fmt.Sprintf(pciDriverBindPath, hostDriver)
-	api.DeviceLogger().WithFields(logrus.Fields{
-		"device-bdf":  bdf,
-		"driver-path": bindDriverPath,
-	}).Info("Binding back device to host driver")
-
-	return utils.WriteToFile(bindDriverPath, []byte(bdf))
+	// Invoke drivers_probe so that the driver matching driver_override, in this case
+	// the previous host driver will probe the device.
+	return utils.WriteToFile(driversProbePath, []byte(bdf))
 }

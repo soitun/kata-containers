@@ -8,7 +8,12 @@ use std::path::Path;
 
 use super::default;
 use crate::config::{ConfigOps, TomlConfig};
-use crate::{eother, resolve_path, validate_path};
+use crate::mount::split_bind_mounts;
+use crate::{eother, validate_path};
+
+#[path = "shared_mount.rs"]
+pub mod shared_mount;
+pub use shared_mount::SharedMount;
 
 /// Type of runtime VirtContainer.
 pub const RUNTIME_NAME_VIRTCONTAINER: &str = "virt_container";
@@ -31,6 +36,17 @@ pub struct Runtime {
     /// If enabled, the runtime will log additional debug messages to the system log.
     #[serde(default, rename = "enable_debug")]
     pub debug: bool,
+
+    /// The log level will be applied to runtime.
+    /// Possible values are:
+    /// - trace
+    /// - debug
+    /// - info
+    /// - warn
+    /// - error
+    /// - critical
+    #[serde(default = "default_runtime_log_level")]
+    pub log_level: String,
 
     /// Enabled experimental feature list, format: ["a", "b"].
     ///
@@ -130,6 +146,39 @@ pub struct Runtime {
     /// Vendor customized runtime configuration.
     #[serde(default, flatten)]
     pub vendor: RuntimeVendor,
+
+    /// If keep_abnormal is enabled, it means that 1) if the runtime exits abnormally, the cleanup process
+    /// will be skipped, and 2) the runtime will not exit even if the health check fails.
+    /// This option is typically used to retain abnormal information for debugging.
+    #[serde(default)]
+    pub keep_abnormal: bool,
+
+    /// Base directory of directly attachable network config, the default value
+    /// is "/run/kata-containers/dans".
+    ///
+    /// Network devices for VM-based containers are allowed to be placed in the
+    /// host netns to eliminate as many hops as possible, which is what we
+    /// called a "directly attachable network". The config, set by special CNI
+    /// plugins, is used to tell the Kata Containers what devices are attached
+    /// to the hypervisor.
+    #[serde(default)]
+    pub dan_conf: String,
+
+    /// shared_mount declarations
+    #[serde(default)]
+    pub shared_mounts: Vec<SharedMount>,
+
+    /// If enabled, the runtime will attempt to use fd passthrough feature for process io.
+    #[serde(default)]
+    pub use_passfd_io: bool,
+
+    /// If fd passthrough io is enabled, the runtime will attempt to use the specified port instead of the default port.
+    #[serde(default = "default_passfd_listener_port")]
+    pub passfd_listener_port: u32,
+}
+
+fn default_passfd_listener_port() -> u32 {
+    default::DEFAULT_PASSFD_LISTENER_PORT
 }
 
 impl ConfigOps for Runtime {
@@ -140,7 +189,14 @@ impl ConfigOps for Runtime {
         }
 
         for bind in conf.runtime.sandbox_bind_mounts.iter_mut() {
-            resolve_path!(*bind, "sandbox bind mount `{}` is invalid: {}")?;
+            // Split the bind mount, canonicalize the path and then append rw mode to it.
+            let (real_path, mode) = split_bind_mounts(bind);
+            match Path::new(real_path).canonicalize() {
+                Err(e) => return Err(eother!("sandbox bind mount `{}` is invalid: {}", bind, e)),
+                Ok(path) => {
+                    *bind = format!("{}{}", path.display(), mode);
+                }
+            }
         }
 
         Ok(())
@@ -169,8 +225,17 @@ impl ConfigOps for Runtime {
             ));
         }
 
+        for shared_mount in &conf.runtime.shared_mounts {
+            shared_mount.validate()?;
+        }
+
         for bind in conf.runtime.sandbox_bind_mounts.iter() {
-            validate_path!(*bind, "sandbox bind mount `{}` is invalid: {}")?;
+            // Just validate the real_path.
+            let (real_path, _mode) = split_bind_mounts(bind);
+            validate_path!(
+                real_path.to_owned(),
+                "sandbox bind mount `{}` is invalid: {}"
+            )?;
         }
 
         Ok(())
@@ -182,6 +247,10 @@ impl Runtime {
     pub fn is_experiment_enabled(&self, feature: &str) -> bool {
         self.experimental.contains(&feature.to_string())
     }
+}
+
+fn default_runtime_log_level() -> String {
+    String::from("info")
 }
 
 #[cfg(not(feature = "enable-vendor"))]

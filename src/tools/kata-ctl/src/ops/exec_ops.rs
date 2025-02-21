@@ -19,11 +19,13 @@ use std::{
 use anyhow::{anyhow, Context};
 use nix::sys::socket::{connect, socket, AddressFamily, SockFlag, SockType, VsockAddr};
 use reqwest::StatusCode;
-use slog::debug;
+use slog::{debug, error, o};
 use vmm_sys_util::terminal::Terminal;
 
 use crate::args::ExecArguments;
 use shim_interface::shim_mgmt::{client::MgmtClient, AGENT_URL};
+
+use crate::utils::TIMEOUT;
 
 const CMD_CONNECT: &str = "CONNECT";
 const CMD_OK: &str = "OK";
@@ -32,7 +34,6 @@ const SCHEME_HYBRID_VSOCK: &str = "HVSOCK";
 
 const EPOLL_EVENTS_LEN: usize = 16;
 const KATA_AGENT_VSOCK_TIMEOUT: u64 = 5;
-const TIMEOUT: Duration = Duration::from_millis(2000);
 
 type Result<T> = std::result::Result<T, Error>;
 
@@ -40,11 +41,12 @@ type Result<T> = std::result::Result<T, Error>;
 #[macro_export]
 macro_rules! sl {
     () => {
-        slog_scope::logger()
+        slog_scope::logger().new(o!("subsystem" => "exec_ops"))
     };
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub enum Error {
     EpollWait(io::Error),
     EpollCreate(io::Error),
@@ -122,7 +124,7 @@ impl EpollContext {
     }
 
     fn do_process_handler(&mut self) -> Result<()> {
-        let mut events = vec![epoll::Event::new(epoll::Events::empty(), 0); EPOLL_EVENTS_LEN];
+        let mut events = [epoll::Event::new(epoll::Events::empty(), 0); EPOLL_EVENTS_LEN];
 
         let epoll_raw_fd = self.epoll_raw_fd;
         let debug_console_sock = self.debug_console_sock.as_mut().unwrap();
@@ -142,7 +144,7 @@ impl EpollContext {
                                 return Ok(());
                             }
                             Err(e) => {
-                                println!("error with errno {:?} while reading stdin", e);
+                                error!(sl!(), "errno {:?} while reading stdin", e);
                                 return Ok(());
                             }
                             Ok(count) => {
@@ -159,7 +161,7 @@ impl EpollContext {
                                 return Ok(());
                             }
                             Err(e) => {
-                                println!("error with errno {:?} while reading server", e);
+                                error!(sl!(), "errno {:?} while reading server", e);
                                 return Ok(());
                             }
                             Ok(count) => {
@@ -326,9 +328,7 @@ fn setup_client(server_url: String, dbg_console_port: u32) -> anyhow::Result<Uni
             vsock.setup_sock().context("set up vsock")
         }
         // Others will be INVALID URI.
-        _ => {
-            return Err(anyhow!("invalid URI scheme: {:?}", scheme));
-        }
+        _ => Err(anyhow!("invalid URI scheme: {:?}", scheme)),
     }
 }
 
@@ -359,7 +359,6 @@ fn get_server_socket(sandbox_id: &str) -> anyhow::Result<String> {
 }
 
 fn do_run_exec(sandbox_id: &str, dbg_console_vport: u32) -> anyhow::Result<()> {
-    // sandbox_id MUST be a long ID.
     let server_url = get_server_socket(sandbox_id).context("get debug console socket URL")?;
     if server_url.is_empty() {
         return Err(anyhow!("server url is empty."));

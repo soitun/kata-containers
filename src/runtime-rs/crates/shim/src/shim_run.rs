@@ -23,6 +23,9 @@ impl ShimExecutor {
         let path = bundle_path.join("log");
         let _logger_guard =
             logger::set_logger(path.to_str().unwrap(), &sid, self.args.debug).context("set logger");
+        // Regist shim logger for later use.
+        logging::register_subsystem_logger("runtimes", "shim");
+
         if try_core_sched().is_err() {
             warn!(
                 sl!(),
@@ -46,7 +49,7 @@ impl ShimExecutor {
         self.args.validate(false).context("validate")?;
 
         let server_fd = get_server_fd().context("get server fd")?;
-        let mut service_manager = service::ServiceManager::new(
+        let service_manager = service::ServiceManager::new(
             &self.args.id,
             &self.args.publish_binary,
             &self.args.address,

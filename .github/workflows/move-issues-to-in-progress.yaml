@@ -13,7 +13,7 @@ on:
 
 jobs:
   move-linked-issues-to-in-progress:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - name: Install hub
         if: ${{ !contains(github.event.pull_request.labels.*.name, 'force-skip-ci') }}
@@ -31,14 +31,24 @@ jobs:
         run: |
           # Clone into a temporary directory to avoid overwriting
           # any existing github directory.
-          pushd $(mktemp -d) &>/dev/null
+          pushd "$(mktemp -d)" &>/dev/null
           git clone --single-branch --depth 1 "https://github.com/kata-containers/.github" && cd .github/scripts
           sudo install hub-util.sh /usr/local/bin
           popd &>/dev/null
 
       - name: Checkout code to allow hub to communicate with the project
         if: ${{ !contains(github.event.pull_request.labels.*.name, 'force-skip-ci') }}
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Rebase atop of the latest target branch
+        if: ${{ !contains(github.event.pull_request.labels.*.name, 'force-skip-ci') }}
+        run: |
+          ./tests/git-helper.sh "rebase-atop-of-the-latest-target-branch"
+        env:
+          TARGET_BRANCH: ${{ github.event.pull_request.base.ref }}
 
       - name: Move issue to "In progress"
         if: ${{ !contains(github.event.pull_request.labels.*.name, 'force-skip-ci') }}
@@ -52,20 +62,19 @@ jobs:
             grep -v "^\#"  |\
             cut -d';' -f3 || true)
 
-          # PR doesn't have any linked issues
-          # (it should, but maybe a new user forgot to add a "Fixes: #XXX" commit).
+          # PR doesn't have any linked issues, handle it only if it exists
           [ -z "$linked_issue_urls" ] && {
-            echo "::error::No linked issues for PR $pr"
-            exit 1
+            echo "::warning::No linked issues for PR $pr"
+            exit 0
           }
 
           project_name="Issue backlog"
           project_type="org"
           project_column="In progress"
 
-          for issue_url in $(echo "$linked_issue_urls")
+          for issue_url in $linked_issue_urls
           do
-            issue=$(echo "$issue_url"| awk -F\/ '{print $NF}' || true)
+            issue=$(echo "$issue_url"| awk -F/ '{print $NF}' || true)
 
             [ -z "$issue" ] && {
               echo "::error::Cannot determine issue number from $issue_url for PR $pr"

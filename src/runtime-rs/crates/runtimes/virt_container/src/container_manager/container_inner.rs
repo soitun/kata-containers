@@ -4,16 +4,18 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-use std::{collections::HashMap, sync::Arc};
-
 use agent::Agent;
 use anyhow::{anyhow, Context, Result};
 use common::{
     error::Error,
     types::{ContainerID, ContainerProcess, ProcessExitStatus, ProcessStatus, ProcessType},
 };
+use hypervisor::device::device_manager::DeviceManager;
 use nix::sys::signal::Signal;
+use oci::LinuxResources;
+use oci_spec::runtime as oci;
 use resource::{rootfs::Rootfs, volume::Volume};
+use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
 
 use crate::container_manager::logger_with_process;
@@ -31,10 +33,16 @@ pub struct ContainerInner {
     pub(crate) exec_processes: HashMap<String, Exec>,
     pub(crate) rootfs: Vec<Arc<dyn Rootfs>>,
     pub(crate) volumes: Vec<Arc<dyn Volume>>,
+    pub(crate) linux_resources: Option<LinuxResources>,
 }
 
 impl ContainerInner {
-    pub(crate) fn new(agent: Arc<dyn Agent>, init_process: Process, logger: slog::Logger) -> Self {
+    pub(crate) fn new(
+        agent: Arc<dyn Agent>,
+        init_process: Process,
+        logger: slog::Logger,
+        linux_resources: Option<LinuxResources>,
+    ) -> Self {
         Self {
             agent,
             logger,
@@ -42,6 +50,7 @@ impl ContainerInner {
             exec_processes: HashMap::new(),
             rootfs: vec![],
             volumes: vec![],
+            linux_resources,
         }
     }
 
@@ -78,6 +87,17 @@ impl ContainerInner {
                 process_id: process.clone().into(),
                 string_user: None,
                 process: Some(exec.oci_process.clone()),
+                stdin_port: exec.process.passfd_io.as_ref().and_then(|io| io.stdin_port),
+                stdout_port: exec
+                    .process
+                    .passfd_io
+                    .as_ref()
+                    .and_then(|io| io.stdout_port),
+                stderr_port: exec
+                    .process
+                    .passfd_io
+                    .as_ref()
+                    .and_then(|io| io.stderr_port),
             })
             .await
             .context("exec process")?;
@@ -157,7 +177,12 @@ impl ContainerInner {
         }
     }
 
-    async fn cleanup_container(&mut self, cid: &str, force: bool) -> Result<()> {
+    pub(crate) async fn cleanup_container(
+        &mut self,
+        cid: &str,
+        force: bool,
+        device_manager: &RwLock<DeviceManager>,
+    ) -> Result<()> {
         // wait until the container process
         // terminated and the status write lock released.
         info!(self.logger, "wait on container terminated");
@@ -186,6 +211,14 @@ impl ContainerInner {
         // close the exit channel to wakeup wait service
         // send to notify watchers who are waiting for the process exit
         self.init_process.stop().await;
+
+        self.clean_volumes(device_manager)
+            .await
+            .context("clean volumes")?;
+        self.clean_rootfs(device_manager)
+            .await
+            .context("clean rootfs")?;
+
         Ok(())
     }
 
@@ -193,6 +226,7 @@ impl ContainerInner {
         &mut self,
         process: &ContainerProcess,
         force: bool,
+        device_manager: &RwLock<DeviceManager>,
     ) -> Result<()> {
         let logger = logger_with_process(process);
         info!(logger, "begin to stop process");
@@ -203,26 +237,24 @@ impl ContainerInner {
             return Ok(());
         }
 
-        self.check_state(vec![ProcessStatus::Running, ProcessStatus::Exited])
+        self.check_state(vec![ProcessStatus::Running])
             .await
             .context("check state")?;
 
-        if state == ProcessStatus::Running {
-            // if use force mode to stop container, stop always successful
-            // send kill signal to container
-            // ignore the error of sending signal, since the process would
-            // have been killed and exited yet.
-            self.signal_process(process, Signal::SIGKILL as u32, false)
-                .await
-                .map_err(|e| {
-                    warn!(logger, "failed to signal kill. {:?}", e);
-                })
-                .ok();
-        }
+        // if use force mode to stop container, stop always successful
+        // send kill signal to container
+        // ignore the error of sending signal, since the process would
+        // have been killed and exited yet.
+        self.signal_process(process, Signal::SIGKILL as u32, false)
+            .await
+            .map_err(|e| {
+                warn!(logger, "failed to signal kill. {:?}", e);
+            })
+            .ok();
 
         match process.process_type {
             ProcessType::Container => self
-                .cleanup_container(&process.container_id.container_id, force)
+                .cleanup_container(&process.container_id.container_id, force, device_manager)
                 .await
                 .context("stop container")?,
             ProcessType::Exec => {
@@ -243,6 +275,10 @@ impl ContainerInner {
         signal: u32,
         all: bool,
     ) -> Result<()> {
+        if self.check_state(vec![ProcessStatus::Stopped]).await.is_ok() {
+            return Ok(());
+        }
+
         let mut process_id: agent::ContainerProcessID = process.clone().into();
         if all {
             // force signal init process
@@ -252,9 +288,6 @@ impl ContainerInner {
         self.agent
             .signal_process(agent::SignalProcessRequest { process_id, signal })
             .await?;
-
-        self.clean_volumes().await.context("clean volumes")?;
-        self.clean_rootfs().await.context("clean rootfs")?;
 
         Ok(())
     }
@@ -278,10 +311,10 @@ impl ContainerInner {
         Ok(())
     }
 
-    async fn clean_volumes(&mut self) -> Result<()> {
+    async fn clean_volumes(&mut self, device_manager: &RwLock<DeviceManager>) -> Result<()> {
         let mut unhandled = Vec::new();
         for v in self.volumes.iter() {
-            if let Err(err) = v.cleanup().await {
+            if let Err(err) = v.cleanup(device_manager).await {
                 unhandled.push(Arc::clone(v));
                 warn!(
                     sl!(),
@@ -297,10 +330,10 @@ impl ContainerInner {
         Ok(())
     }
 
-    async fn clean_rootfs(&mut self) -> Result<()> {
+    async fn clean_rootfs(&mut self, device_manager: &RwLock<DeviceManager>) -> Result<()> {
         let mut unhandled = Vec::new();
         for rootfs in self.rootfs.iter() {
-            if let Err(err) = rootfs.cleanup().await {
+            if let Err(err) = rootfs.cleanup(device_manager).await {
                 unhandled.push(Arc::clone(rootfs));
                 warn!(
                     sl!(),

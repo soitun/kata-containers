@@ -16,17 +16,22 @@ use crossbeam_channel::{unbounded, Receiver, Sender};
 use dragonball::{
     api::v1::{
         BlockDeviceConfigInfo, BootSourceConfig, FsDeviceConfigInfo, FsMountConfigInfo,
-        InstanceInfo, InstanceState, VirtioNetDeviceConfigInfo, VmmAction, VmmActionError, VmmData,
-        VmmRequest, VmmResponse, VmmService, VsockDeviceConfigInfo,
+        InstanceInfo, InstanceState, NetworkInterfaceConfig, VcpuResizeInfo, VmmAction,
+        VmmActionError, VmmData, VmmRequest, VmmResponse, VmmService, VsockDeviceConfigInfo,
+    },
+    device_manager::{
+        balloon_dev_mgr::BalloonDeviceConfigInfo, mem_dev_mgr::MemDeviceConfigInfo,
+        vfio_dev_mgr::HostDeviceConfig,
     },
     vm::VmConfigInfo,
     Vmm,
 };
 use nix::sched::{setns, CloneFlags};
 use seccompiler::BpfProgram;
+use tokio::sync::mpsc;
 use vmm_sys_util::eventfd::EventFd;
 
-use crate::ShareFsOperation;
+use crate::ShareFsMountOperation;
 
 pub enum Request {
     Sync(VmmAction),
@@ -36,6 +41,7 @@ const DRAGONBALL_VERSION: &str = env!("CARGO_PKG_VERSION");
 const REQUEST_RETRY: u32 = 500;
 const KVM_DEVICE: &str = "/dev/kvm";
 
+#[derive(Debug)]
 pub struct VmmInstance {
     /// VMM instance info directly accessible from runtime
     vmm_shared_info: Arc<RwLock<InstanceInfo>>,
@@ -44,10 +50,11 @@ pub struct VmmInstance {
     to_vmm_fd: EventFd,
     seccomp: BpfProgram,
     vmm_thread: Option<thread::JoinHandle<Result<i32>>>,
+    exit_notify: Option<mpsc::Sender<i32>>,
 }
 
 impl VmmInstance {
-    pub fn new(id: &str) -> Self {
+    pub fn new(id: &str, exit_notify: mpsc::Sender<i32>) -> Self {
         let vmm_shared_info = Arc::new(RwLock::new(InstanceInfo::new(
             String::from(id),
             DRAGONBALL_VERSION.to_string(),
@@ -63,6 +70,7 @@ impl VmmInstance {
             to_vmm_fd,
             seccomp: vec![],
             vmm_thread: None,
+            exit_notify: Some(exit_notify),
         }
     }
 
@@ -117,6 +125,7 @@ impl VmmInstance {
         )
         .expect("Failed to start vmm");
         let vmm_shared_info = self.get_shared_info();
+        let exit_notify = self.exit_notify.take().unwrap();
 
         self.vmm_thread = Some(
             thread::Builder::new()
@@ -136,6 +145,12 @@ impl VmmInstance {
                         }
                         let exit_code =
                             Vmm::run_vmm_event_loop(Arc::new(Mutex::new(vmm)), vmm_service);
+                        exit_notify
+                            .try_send(exit_code)
+                            .map_err(|e| {
+                                error!(sl!(), "vmm-master thread fail to send. {:?}", e);
+                            })
+                            .ok();
                         debug!(sl!(), "run vmm thread exited: {}", exit_code);
                         Ok(exit_code)
                     }()
@@ -192,6 +207,35 @@ impl VmmInstance {
         Err(anyhow!("Failed to get machine info"))
     }
 
+    pub fn insert_host_device(&self, device_cfg: HostDeviceConfig) -> Result<Option<u8>> {
+        if let VmmData::VfioDeviceData(guest_dev_id) = self.handle_request_with_retry(
+            Request::Sync(VmmAction::InsertHostDevice(device_cfg.clone())),
+        )? {
+            Ok(guest_dev_id)
+        } else {
+            Err(anyhow!(format!(
+                "Failed to insert host device {:?}",
+                device_cfg
+            )))
+        }
+    }
+
+    pub fn prepare_remove_host_device(&self, id: &str) -> Result<()> {
+        info!(sl!(), "prepare to remove host device {}", id);
+        self.handle_request(Request::Sync(VmmAction::PrepareRemoveHostDevice(
+            id.to_string(),
+        )))
+        .with_context(|| format!("Prepare to remove host device {:?} failed", id))?;
+        Ok(())
+    }
+
+    pub fn remove_host_device(&self, id: &str) -> Result<()> {
+        info!(sl!(), "remove host device {}", id);
+        self.handle_request(Request::Sync(VmmAction::RemoveHostDevice(id.to_string())))
+            .with_context(|| format!("Failed to remove host device {:?}", id))?;
+        Ok(())
+    }
+
     pub fn insert_block_device(&self, device_cfg: BlockDeviceConfigInfo) -> Result<()> {
         self.handle_request_with_retry(Request::Sync(VmmAction::InsertBlockDevice(
             device_cfg.clone(),
@@ -215,7 +259,7 @@ impl VmmInstance {
         Ok(())
     }
 
-    pub fn insert_network_device(&self, net_cfg: VirtioNetDeviceConfigInfo) -> Result<()> {
+    pub fn insert_network_device(&self, net_cfg: NetworkInterfaceConfig) -> Result<()> {
         self.handle_request_with_retry(Request::Sync(VmmAction::InsertNetworkDevice(
             net_cfg.clone(),
         )))
@@ -237,7 +281,7 @@ impl VmmInstance {
         Ok(())
     }
 
-    pub fn patch_fs(&self, cfg: &FsMountConfigInfo, op: ShareFsOperation) -> Result<()> {
+    pub fn patch_fs(&self, cfg: &FsMountConfigInfo, op: ShareFsMountOperation) -> Result<()> {
         self.handle_request(Request::Sync(VmmAction::ManipulateFsBackendFs(cfg.clone())))
             .with_context(|| {
                 format!(
@@ -245,6 +289,24 @@ impl VmmInstance {
                     op, cfg.fstype, cfg.mountpoint, cfg
                 )
             })?;
+        Ok(())
+    }
+
+    pub fn resize_vcpu(&self, cfg: &VcpuResizeInfo) -> Result<()> {
+        self.handle_request(Request::Sync(VmmAction::ResizeVcpu(cfg.clone())))
+            .with_context(|| format!("Failed to resize_vm(hotplug vcpu), cfg: {:?}", cfg))?;
+        Ok(())
+    }
+
+    pub fn insert_mem_device(&self, cfg: MemDeviceConfigInfo) -> Result<()> {
+        self.handle_request(Request::Sync(VmmAction::InsertMemDevice(cfg.clone())))
+            .with_context(|| format!("Failed to insert memory device : {:?}", cfg))?;
+        Ok(())
+    }
+
+    pub fn insert_balloon_device(&self, cfg: BalloonDeviceConfigInfo) -> Result<()> {
+        self.handle_request(Request::Sync(VmmAction::InsertBalloonDevice(cfg.clone())))
+            .with_context(|| format!("Failed to insert balloon device: {:?}", cfg))?;
         Ok(())
     }
 
@@ -258,6 +320,15 @@ impl VmmInstance {
 
     pub fn pid(&self) -> u32 {
         std::process::id()
+    }
+
+    pub fn get_hypervisor_metrics(&self) -> Result<String> {
+        if let Ok(VmmData::HypervisorMetrics(metrics)) =
+            self.handle_request(Request::Sync(VmmAction::GetHypervisorMetrics))
+        {
+            return Ok(metrics);
+        }
+        Err(anyhow!("Failed to get hypervisor metrics"))
     }
 
     pub fn stop(&mut self) -> Result<()> {

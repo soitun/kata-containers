@@ -39,7 +39,6 @@ var (
 
 const (
 	typeVirtioFSCacheModeNever  = "never"
-	typeVirtioFSCacheModeNone   = "none"
 	typeVirtioFSCacheModeAlways = "always"
 	typeVirtioFSCacheModeAuto   = "auto"
 )
@@ -186,16 +185,11 @@ func (v *virtiofsd) args(FdSocketNumber uint) ([]string, error) {
 		// Send logs to syslog
 		"--syslog",
 		// cache mode for virtiofsd
-		"-o", "cache=" + v.cache,
-		// disable posix locking in daemon: bunch of basic posix locks properties are broken
-		// apt-get update is broken if enabled
-		"-o", "no_posix_lock",
+		"--cache=" + v.cache,
 		// shared directory tree
-		"-o", "source=" + v.sourcePath,
+		"--shared-dir=" + v.sourcePath,
 		// fd number of vhost-user socket
 		fmt.Sprintf("--fd=%v", FdSocketNumber),
-		// foreground operation
-		"-f",
 	}
 
 	if len(v.extraArgs) != 0 {
@@ -224,9 +218,6 @@ func (v *virtiofsd) valid() error {
 
 	if v.cache == "" {
 		v.cache = typeVirtioFSCacheModeAuto
-	} else if v.cache == typeVirtioFSCacheModeNone {
-		v.Logger().Warn("virtio-fs cache mode `none` is deprecated since Kata Containers 2.5.0 and will be removed in the future release, please use `never` instead. For more details please refer to https://github.com/kata-containers/kata-containers/issues/4234.")
-		v.cache = typeVirtioFSCacheModeNever
 	} else if v.cache != typeVirtioFSCacheModeAuto && v.cache != typeVirtioFSCacheModeAlways && v.cache != typeVirtioFSCacheModeNever {
 		return errVirtiofsdInvalidVirtiofsCacheMode(v.cache)
 	}

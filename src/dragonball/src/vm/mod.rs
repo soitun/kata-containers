@@ -138,6 +138,9 @@ pub struct VmConfigInfo {
 
     /// sock path
     pub serial_path: Option<String>,
+
+    /// Enable PCI device hotplug or not
+    pub pci_hotplug_enabled: bool,
 }
 
 impl Default for VmConfigInfo {
@@ -157,6 +160,7 @@ impl Default for VmConfigInfo {
             mem_file_path: String::from(""),
             mem_size_mib: 128,
             serial_path: None,
+            pci_hotplug_enabled: false,
         }
     }
 }
@@ -182,7 +186,8 @@ pub struct Vm {
     shared_info: Arc<RwLock<InstanceInfo>>,
 
     address_space: AddressSpaceMgr,
-    device_manager: DeviceManager,
+    /// device manager for Dragonball
+    pub device_manager: DeviceManager,
     dmesg_fifo: Option<Box<dyn io::Write + Send>>,
     kernel_config: Option<KernelConfigInfo>,
     logger: slog::Logger,
@@ -222,6 +227,7 @@ impl Vm {
             resource_manager.clone(),
             epoll_manager.clone(),
             &logger,
+            api_shared_info.clone(),
         );
 
         Ok(Vm {
@@ -385,6 +391,19 @@ impl Vm {
 
         (dragonball_version, instance_id)
     }
+
+    pub(crate) fn stop_prealloc(&mut self) -> std::result::Result<(), StartMicroVmError> {
+        if self.address_space.is_initialized() {
+            return self
+                .address_space
+                .wait_prealloc(true)
+                .map_err(StartMicroVmError::AddressManagerError);
+        }
+
+        Err(StartMicroVmError::AddressManagerError(
+            AddressManagerError::GuestMemoryNotInitialized,
+        ))
+    }
 }
 
 impl Vm {
@@ -453,7 +472,6 @@ impl Vm {
     ) -> std::result::Result<(), StartMicroVmError> {
         info!(self.logger, "VM: initializing devices ...");
 
-        let com1_sock_path = self.vm_config.serial_path.clone();
         let kernel_config = self
             .kernel_config
             .as_mut()
@@ -475,13 +493,13 @@ impl Vm {
             vm_as.clone(),
             epoll_manager,
             kernel_config,
-            com1_sock_path,
             self.dmesg_fifo.take(),
             self.address_space.address_space(),
+            &self.vm_config,
         )?;
 
         info!(self.logger, "VM: start devices");
-        self.device_manager.start_devices()?;
+        self.device_manager.start_devices(vm_as)?;
 
         info!(self.logger, "VM: initializing devices done");
         Ok(())
@@ -750,7 +768,6 @@ impl Vm {
 impl Vm {
     #[cfg(feature = "dbs-upcall")]
     /// initialize upcall client for guest os
-    #[cfg(feature = "dbs-upcall")]
     fn new_upcall(&mut self) -> std::result::Result<(), StartMicroVmError> {
         // get vsock inner connector for upcall
         let inner_connector = self
@@ -792,7 +809,6 @@ impl Vm {
 
     #[cfg(feature = "dbs-upcall")]
     /// Get upcall client.
-    #[cfg(feature = "dbs-upcall")]
     pub fn upcall_client(&self) -> &Option<Arc<UpcallClient<DevMgrService>>> {
         &self.upcall_client
     }
@@ -812,7 +828,7 @@ impl Vm {
     }
 
     /// Resize MicroVM vCPU number
-    #[cfg(feature = "hotplug")]
+    #[cfg(feature = "dbs-upcall")]
     pub fn resize_vcpu(
         &mut self,
         config: VcpuResizeInfo,
@@ -860,6 +876,9 @@ impl Vm {
 
 #[cfg(test)]
 pub mod tests {
+    #[cfg(target_arch = "aarch64")]
+    use dbs_boot::layout::GUEST_MEM_START;
+    #[cfg(target_arch = "x86_64")]
     use kvm_ioctls::VcpuExit;
     use linux_loader::cmdline::Cmdline;
     use test_utils::skip_if_not_root;
@@ -914,6 +933,7 @@ pub mod tests {
                 sockets: 1,
             },
             vpmu_feature: 0,
+            pci_hotplug_enabled: false,
         };
 
         let mut vm = create_vm_instance();
@@ -922,7 +942,13 @@ pub mod tests {
         let vm_memory = vm.address_space.vm_memory().unwrap();
 
         assert_eq!(vm_memory.num_regions(), 1);
+        #[cfg(target_arch = "x86_64")]
         assert_eq!(vm_memory.last_addr(), GuestAddress(0xffffff));
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(
+            vm_memory.last_addr(),
+            GuestAddress(GUEST_MEM_START + 0xffffff)
+        );
 
         // Reconfigure an already configured vm will be ignored and just return OK.
         let vm_config = VmConfigInfo {
@@ -940,14 +966,24 @@ pub mod tests {
                 sockets: 1,
             },
             vpmu_feature: 0,
+            pci_hotplug_enabled: false,
         };
         vm.set_vm_config(vm_config);
         assert!(vm.init_guest_memory().is_ok());
         let vm_memory = vm.address_space.vm_memory().unwrap();
         assert_eq!(vm_memory.num_regions(), 1);
+        #[cfg(target_arch = "x86_64")]
         assert_eq!(vm_memory.last_addr(), GuestAddress(0xffffff));
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(
+            vm_memory.last_addr(),
+            GuestAddress(GUEST_MEM_START + 0xffffff)
+        );
 
+        #[cfg(target_arch = "x86_64")]
         let obj_addr = GuestAddress(0xf0);
+        #[cfg(target_arch = "aarch64")]
+        let obj_addr = GuestAddress(GUEST_MEM_START + 0xf0);
         vm_memory.write_obj(67u8, obj_addr).unwrap();
         let read_val: u8 = vm_memory.read_obj(obj_addr).unwrap();
         assert_eq!(read_val, 67u8);
@@ -979,6 +1015,7 @@ pub mod tests {
                 sockets: 1,
             },
             vpmu_feature: 0,
+            pci_hotplug_enabled: false,
         };
 
         vm.set_vm_config(vm_config);
@@ -987,10 +1024,16 @@ pub mod tests {
 
         let vm_memory = vm.address_space.vm_memory().unwrap();
         assert_eq!(vm_memory.num_regions(), 1);
+        #[cfg(target_arch = "x86_64")]
         assert_eq!(vm_memory.last_addr(), GuestAddress(0xffffff));
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(
+            vm_memory.last_addr(),
+            GuestAddress(GUEST_MEM_START + 0xffffff)
+        );
 
         let kernel_file = TempFile::new().unwrap();
-        let cmd_line = Cmdline::new(64);
+        let cmd_line = Cmdline::new(64).unwrap();
 
         vm.set_kernel_config(KernelConfigInfo::new(
             kernel_file.into_file(),
@@ -1049,6 +1092,7 @@ pub mod tests {
                 sockets: 1,
             },
             vpmu_feature: 0,
+            pci_hotplug_enabled: false,
         };
 
         vm.set_vm_config(vm_config);

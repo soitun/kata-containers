@@ -21,6 +21,7 @@ macro_rules! sl {
 }
 
 mod client;
+mod image;
 mod rpc;
 mod types;
 mod utils;
@@ -314,7 +315,7 @@ fn real_main() -> Result<()> {
             Ok(())
         }
         "connect" => connect(name, args),
-        _ => return Err(anyhow!(format!("invalid sub-command: {:?}", subcmd))),
+        _ => Err(anyhow!(format!("invalid sub-command: {:?}", subcmd))),
     }
 }
 

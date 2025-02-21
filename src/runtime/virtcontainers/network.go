@@ -195,6 +195,8 @@ type NetworkConfig struct {
 	InterworkingModel NetInterworkingModel
 	NetworkCreated    bool
 	DisableNewNetwork bool
+	// if DAN config exists, use it to config network
+	DanConfigPath string
 }
 
 type Network interface {
@@ -226,12 +228,13 @@ type Network interface {
 
 	// SetEndpoints sets a sandbox's network endpoints.
 	SetEndpoints([]Endpoint)
+
+	// GetEndpoints number of sandbox's network endpoints.
+	GetEndpointsNum() (int, error)
 }
 
-func generateVCNetworkStructures(ctx context.Context, network Network) ([]*pbTypes.Interface, []*pbTypes.Route, []*pbTypes.ARPNeighbor, error) {
-	if network.NetworkID() == "" {
-		return nil, nil, nil, nil
-	}
+func generateVCNetworkStructures(ctx context.Context, endpoints []Endpoint) ([]*pbTypes.Interface, []*pbTypes.Route, []*pbTypes.ARPNeighbor, error) {
+
 	span, _ := networkTrace(ctx, "generateVCNetworkStructures", nil)
 	defer span.End()
 
@@ -239,7 +242,7 @@ func generateVCNetworkStructures(ctx context.Context, network Network) ([]*pbTyp
 	var ifaces []*pbTypes.Interface
 	var neighs []*pbTypes.ARPNeighbor
 
-	for _, endpoint := range network.Endpoints() {
+	for _, endpoint := range endpoints {
 		var ipAddresses []*pbTypes.IPAddress
 		for _, addr := range endpoint.Properties().Addrs {
 			// Skip localhost interface
@@ -265,6 +268,7 @@ func generateVCNetworkStructures(ctx context.Context, network Network) ([]*pbTyp
 			Device:      endpoint.Name(),
 			Name:        endpoint.Name(),
 			Mtu:         uint64(endpoint.Properties().Iface.MTU),
+			Type:        string(endpoint.Type()),
 			RawFlags:    noarp,
 			HwAddr:      endpoint.HardwareAddr(),
 			PciPath:     endpoint.PciPath().String(),

@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-FROM ubuntu:20.04
+FROM ubuntu:22.04
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && \
@@ -15,7 +15,7 @@ RUN apt-get update && \
         iasl  \
         make \
         nasm \
-        python \
+        python-is-python3 \
         python3 \
         python3-distutils \
         uuid-dev && \

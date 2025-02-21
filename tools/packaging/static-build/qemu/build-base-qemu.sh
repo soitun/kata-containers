@@ -14,6 +14,12 @@ readonly qemu_builder="${script_dir}/build-qemu.sh"
 source "${script_dir}/../../scripts/lib.sh"
 source "${script_dir}/../qemu.blacklist"
 
+ARCH=${ARCH:-$(uname -m)}
+dpkg_arch=":${ARCH}"
+[ ${dpkg_arch} == ":aarch64" ] && dpkg_arch=":arm64"
+[ ${dpkg_arch} == ":x86_64" ] && dpkg_arch=""
+[ "${dpkg_arch}" == ":ppc64le" ] && dpkg_arch=":ppc64el"
+
 packaging_dir="${script_dir}/../.."
 qemu_destdir="/tmp/qemu-static/"
 container_engine="${USE_PODMAN:+podman}"
@@ -39,30 +45,33 @@ CACHE_TIMEOUT=$(date +"%Y-%m-%d")
 [ -n "${build_suffix}" ] && PKGVERSION="kata-static-${build_suffix}" || PKGVERSION="kata-static"
 
 container_image="${QEMU_CONTAINER_BUILDER:-$(get_qemu_image_name)}"
+[ "${CROSS_BUILD}" == "true" ] && container_image="${container_image}-cross-build"
 
-sudo docker pull ${container_image} || (sudo "${container_engine}" build \
+${container_engine} pull ${container_image} || ("${container_engine}" build \
 	--build-arg CACHE_TIMEOUT="${CACHE_TIMEOUT}" \
 	--build-arg http_proxy="${http_proxy}" \
 	--build-arg https_proxy="${https_proxy}" \
+	--build-arg DPKG_ARCH="${dpkg_arch}" \
+	--build-arg ARCH="${ARCH}" \
 	"${packaging_dir}" \
 	-f "${script_dir}/Dockerfile" \
 	-t "${container_image}" && \
-	 # No-op unless PUSH_TO_REGISTRY is exported as "yes"
-	 push_to_registry "${container_image}")
+	# No-op unless PUSH_TO_REGISTRY is exported as "yes"
+	push_to_registry "${container_image}")
 
-sudo "${container_engine}" run \
-	--rm \
-	-i \
+"${container_engine}" run --rm -i \
 	--env BUILD_SUFFIX="${build_suffix}" \
-	--env HYPERVISOR_NAME="${HYPERVISOR_NAME}" \
 	--env PKGVERSION="${PKGVERSION}" \
 	--env QEMU_DESTDIR="${qemu_destdir}" \
 	--env QEMU_REPO="${qemu_repo}" \
-	--env QEMU_VERSION="${qemu_version}" \
 	--env QEMU_TARBALL="${qemu_tar}" \
 	--env PREFIX="${prefix}" \
-	-v "${repo_root_dir}:/root/kata-containers" \
+	--env HYPERVISOR_NAME="${HYPERVISOR_NAME}" \
+	--env QEMU_VERSION_NUM="${qemu_version}" \
+	--env ARCH="${ARCH}" \
+	--user "$(id -u)":"$(id -g)" \
+	-w "${PWD}" \
+	-v "${repo_root_dir}:${repo_root_dir}" \
 	-v "${PWD}":/share "${container_image}" \
-	bash -c "/root/kata-containers/tools/packaging/static-build/qemu/build-qemu.sh"
+	bash -c "${qemu_builder}"
 
-sudo chown ${USER}:$(id -gn ${USER}) "${PWD}/${qemu_tar}"

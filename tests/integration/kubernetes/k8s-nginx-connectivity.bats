@@ -9,21 +9,27 @@ load "${BATS_TEST_DIRNAME}/../../common.bash"
 load "${BATS_TEST_DIRNAME}/tests_common.sh"
 
 setup() {
+	[ "${CONTAINER_RUNTIME}" == "crio" ] && skip "test not working see: https://github.com/kata-containers/kata-containers/issues/10414"
+
 	nginx_version="${docker_images_nginx_version}"
 	nginx_image="nginx:$nginx_version"
-	busybox_image="busybox"
+	busybox_image="quay.io/prometheus/busybox:latest"
 	deployment="nginx-deployment"
 
 	get_pod_config_dir
+
+	# Create test .yaml
+	yaml_file="${pod_config_dir}/test-${deployment}.yaml"
+
+	sed -e "s/\${nginx_version}/${nginx_image}/" \
+		"${pod_config_dir}/${deployment}.yaml" > "${yaml_file}"
+	
+	add_allow_all_policy_to_yaml "${yaml_file}"
 }
 
 @test "Verify nginx connectivity between pods" {
 
-	# Create test .yaml
-	sed -e "s/\${nginx_version}/${nginx_image}/" \
-		"${pod_config_dir}/${deployment}.yaml" > "${pod_config_dir}/test-${deployment}.yaml"
-
-	kubectl create -f "${pod_config_dir}/test-${deployment}.yaml"
+	kubectl create -f "${yaml_file}"
 	kubectl wait --for=condition=Available --timeout=$timeout deployment/${deployment}
 	kubectl expose deployment/${deployment}
 
@@ -38,6 +44,8 @@ setup() {
 }
 
 teardown() {
+	[ "${CONTAINER_RUNTIME}" == "crio" ] && skip "test not working see: https://github.com/kata-containers/kata-containers/issues/10414"
+
 	# Debugging information
 	kubectl describe "pod/$busybox_pod"
 	kubectl get "pod/$busybox_pod" -o yaml
@@ -46,7 +54,7 @@ teardown() {
 	kubectl get service/${deployment} -o yaml
 	kubectl get endpoints/${deployment} -o yaml
 
-	rm -f "${pod_config_dir}/test-${deployment}.yaml"
+	rm -f "${yaml_file}"
 	kubectl delete deployment "$deployment"
 	kubectl delete service "$deployment"
 	kubectl delete pod "$busybox_pod"

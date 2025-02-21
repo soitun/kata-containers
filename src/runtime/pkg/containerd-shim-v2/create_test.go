@@ -13,13 +13,14 @@ import (
 	"path"
 	"testing"
 
+	taskAPI "github.com/containerd/containerd/api/runtime/task/v2"
 	"github.com/containerd/containerd/namespaces"
-	taskAPI "github.com/containerd/containerd/runtime/v2/task"
+	"github.com/containerd/containerd/protobuf"
 	crioption "github.com/containerd/cri-containerd/pkg/api/runtimeoptions/v1"
-	"github.com/containerd/typeurl"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/stretchr/testify/assert"
 
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/config"
 	ktu "github.com/kata-containers/kata-containers/src/runtime/pkg/katatestutils"
 	vc "github.com/kata-containers/kata-containers/src/runtime/virtcontainers"
 	vcAnnotations "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/annotations"
@@ -307,7 +308,9 @@ func TestCreateContainerConfigFail(t *testing.T) {
 	assert.Error(err)
 }
 
-func createAllRuntimeConfigFiles(dir, hypervisor string) (config string, err error) {
+func createAllRuntimeConfigFiles(dir, hypervisor string) (runtimeConfig string, err error) {
+	var hotPlugVFIO config.PCIePort
+	var coldPlugVFIO config.PCIePort
 	if dir == "" {
 		return "", fmt.Errorf("BUG: need directory")
 	}
@@ -327,29 +330,33 @@ func createAllRuntimeConfigFiles(dir, hypervisor string) (config string, err err
 	disableBlockDevice := true
 	blockDeviceDriver := "virtio-scsi"
 	enableIOThreads := true
-	hotplugVFIOOnRootBus := true
-	pcieRootPort := uint32(2)
 	disableNewNetNs := false
 	sharedFS := "virtio-9p"
 	virtioFSdaemon := path.Join(dir, "virtiofsd")
+	hotPlugVFIO = config.BridgePort
+	coldPlugVFIO = config.NoPort
+	pcieRootPort := uint32(0)
+	pcieSwitchPort := uint32(0)
 
 	configFileOptions := ktu.RuntimeConfigOptions{
-		Hypervisor:           "qemu",
-		HypervisorPath:       hypervisorPath,
-		KernelPath:           kernelPath,
-		ImagePath:            imagePath,
-		RootfsType:           rootfsType,
-		KernelParams:         kernelParams,
-		MachineType:          machineType,
-		LogPath:              logPath,
-		DisableBlock:         disableBlockDevice,
-		BlockDeviceDriver:    blockDeviceDriver,
-		EnableIOThreads:      enableIOThreads,
-		HotplugVFIOOnRootBus: hotplugVFIOOnRootBus,
-		PCIeRootPort:         pcieRootPort,
-		DisableNewNetNs:      disableNewNetNs,
-		SharedFS:             sharedFS,
-		VirtioFSDaemon:       virtioFSdaemon,
+		Hypervisor:        "qemu",
+		HypervisorPath:    hypervisorPath,
+		KernelPath:        kernelPath,
+		ImagePath:         imagePath,
+		RootfsType:        rootfsType,
+		KernelParams:      kernelParams,
+		MachineType:       machineType,
+		LogPath:           logPath,
+		DisableBlock:      disableBlockDevice,
+		BlockDeviceDriver: blockDeviceDriver,
+		EnableIOThreads:   enableIOThreads,
+		DisableNewNetNs:   disableNewNetNs,
+		SharedFS:          sharedFS,
+		VirtioFSDaemon:    virtioFSdaemon,
+		HotPlugVFIO:       hotPlugVFIO,
+		ColdPlugVFIO:      coldPlugVFIO,
+		PCIeRootPort:      pcieRootPort,
+		PCIeSwitchPort:    pcieSwitchPort,
 	}
 
 	runtimeConfigFileData := ktu.MakeRuntimeConfigFileData(configFileOptions)
@@ -392,7 +399,7 @@ func TestCreateLoadRuntimeConfig(t *testing.T) {
 	fakeConfig := "foobar"
 	anno[vcAnnotations.SandboxConfigPathKey] = fakeConfig
 	option := &crioption.Options{ConfigPath: fakeConfig}
-	r.Options, err = typeurl.MarshalAny(option)
+	r.Options, err = protobuf.MarshalAnyToProto(option)
 	assert.NoError(err)
 	err = os.Setenv("KATA_CONF_FILE", fakeConfig)
 	assert.NoError(err)
@@ -410,12 +417,12 @@ func TestCreateLoadRuntimeConfig(t *testing.T) {
 
 	// 2. shimv2 create task option
 	option.ConfigPath = config
-	r.Options, err = typeurl.MarshalAny(option)
+	r.Options, err = protobuf.MarshalAnyToProto(option)
 	assert.NoError(err)
 	_, err = loadRuntimeConfig(s, r, anno)
 	assert.NoError(err)
 	option.ConfigPath = ""
-	r.Options, err = typeurl.MarshalAny(option)
+	r.Options, err = protobuf.MarshalAnyToProto(option)
 	assert.NoError(err)
 
 	// 3. environment
